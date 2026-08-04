@@ -1,0 +1,22 @@
+# core
+torch
+torchvision
+numpy
+opencv-python
+Pillow
+
+# detection
+transformers>=4.44.0    # GroundingDINO via AutoModelForZeroShotObjectDetection
+ultralytics             # YOLO-World
+
+# segmentation
+sam2                    # Meta SAM2 (pip install sam2)
+
+# structure-from-motion
+pycolmap
+
+# visualization
+matplotlib
+
+# Roboflow inference (from earlier step)
+inference-sdk

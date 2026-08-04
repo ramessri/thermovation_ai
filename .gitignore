@@ -1,0 +1,14 @@
+# Data & pipeline output
+Boilers.coco
+dataset
+output
+
+# Python
+__pycache__
+*.pyc
+*.pt
+
+# Docs (for LLM assisted coding)
+CLAUDE.md
+DATA_COLLECTION_PROTOCOL.md
+llm_context.md
