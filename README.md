@@ -200,11 +200,6 @@ camera model (same distortion convention, transplants directly), then fed into
 `run_sfm.py --calib` as **fixed** intrinsics (`ba_refine_focal_length/principal_point/
 extra_params = False`) instead of letting bundle adjustment re-guess them.
 
-**GPU**: the user's driver was fine, but the PyPI `pycolmap` wheel is CPU-only
-(`pycolmap.has_cuda == False`). Rather than a from-source CUDA build (hours, heavy
-toolchain), installed a prebuilt CUDA wheel from
-[lyehe/build_gpu_colmap](https://github.com/lyehe/build_gpu_colmap) — verified
-`has_cuda == True` after install. Feature extraction on IMG_3126: 38s (CPU) → 10s (GPU).
 
 **A real, measured before/after — not just internal self-consistency:**
 
