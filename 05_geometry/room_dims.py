@@ -106,6 +106,35 @@ def density_peak(vals: np.ndarray, lo_pct: float, hi_pct: float,
     return float((edges[i] + edges[i + 1]) / 2)
 
 
+def gravity_rotation(rec: pycolmap.Reconstruction, pts_cm: np.ndarray) -> tuple[np.ndarray, float | None]:
+    """
+    Rotation taking world -> gravity-aligned (+Z up), refined on floor inliers.
+
+    `pts_cm` are the filtered sparse points already scaled to centimeters.
+    Returns (R, z_floor) where z_floor is the floor height in the resulting
+    frame (pts_cm @ R.T), or None if the floor density peak couldn't be
+    localized.
+    """
+    up = up_from_cameras(rec)
+    for _ in range(2):
+        R = rotation_to_z(up)
+        z = (pts_cm @ R.T)[:, 2]
+        z_floor = density_peak(z, 0.5, 35.0)
+        if z_floor is None:
+            break
+        floor_pts = pts_cm[np.abs(z - z_floor) < 6.0]
+        if len(floor_pts) < 50:
+            break
+        # least-squares plane normal of floor inliers
+        c = floor_pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(floor_pts - c)
+        n = vt[-1]
+        up = n if n @ up > 0 else -n
+    R = rotation_to_z(up)
+    z_floor = density_peak((pts_cm @ R.T)[:, 2], 0.5, 35.0)
+    return R, z_floor
+
+
 def main():
     parser = argparse.ArgumentParser(description="Room dimensions from scaled SfM model")
     parser.add_argument("sfm_dir", type=Path,
@@ -123,26 +152,10 @@ def main():
     print(f"Filtered points: {len(pts)}")
 
     # align gravity to +Z (prior from cameras, refined on floor inliers)
-    up = up_from_cameras(rec)
-    for _ in range(2):
-        R = rotation_to_z(up)
-        z = (pts @ R.T)[:, 2]
-        z_floor = density_peak(z, 0.5, 35.0)
-        if z_floor is None:
-            break
-        floor_pts = pts[np.abs(z - z_floor) < 6.0]
-        if len(floor_pts) < 50:
-            break
-        # least-squares plane normal of floor inliers
-        c = floor_pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(floor_pts - c)
-        n = vt[-1]
-        up = n if n @ up > 0 else -n
-    R = rotation_to_z(up)
+    R, z_floor = gravity_rotation(rec, pts)
     ptsR = pts @ R.T
 
     z = ptsR[:, 2]
-    z_floor = density_peak(z, 0.5, 35.0)
     if z_floor is None:
         print("FAILED: could not localize the floor density peak")
         return

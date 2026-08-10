@@ -374,6 +374,80 @@ for an unrelated reason (109–124 points survive spatial clustering), so the ta
 consistent rather than new: **its low-confidence flag isn't just conservative bookkeeping —
 the underlying numbers genuinely aren't reproducible**, unlike the reliable-footprint videos.
 
+### Calibration/triangulation correspondence bug fix — all 5 videos (2026-08-09) ✦ finding
+
+**The bug:** `calibrate_camera.py`'s `collect_views()` (and `scale_sfm.py`'s triangulation
+input) built each view's image points by reprojecting the known marker geometry
+(`GRID_CM`) through the homography `H` that `detect_marker()` had *just fit from those
+same 9 detected points* — i.e. feeding `cv2.calibrateCamera` the homography's own
+best-fit approximation of the corners, not the corners actually detected in the image.
+This silently discarded the real detector noise the optimizer needs to solve for a
+genuine lens model, and made the reported per-view fit look artificially clean.
+
+**Fix:** `detect_marker()` now also returns `grid_pts_full` — the actual 9 detected
+square-center pixels, in the same row-major order as `GRID_CM` — and both
+`calibrate_camera.py` and `scale_sfm.py` use those directly. `H` is now used only for
+px/cm scale, detection validation, and rejecting false positives, never as a source of
+calibration/triangulation coordinates.
+
+**Effect, all 5 videos rerun (`run.py --calibrate --gpu --force`, `--placement` not run
+this pass):**
+
+| Video | Calibration | Scale | L × W (cm) | H (cm) |
+|---|---|---|---|---|
+| IMG_3126 | 664px, RMS 0.76px (80 views) | 38.98 cm/u (marker) | 423 × 184 | ≥135 [LOW CONF.] |
+| IMG_3128 | 720px, RMS 0.78px (80 views) | 30.52 cm/u (depth-ratio) | 446 × 177 | ≥113 [LOW CONF.] |
+| MicrosoftTeams | too few sightings → self-cal | 23.28 cm/u (depth-ratio) | 259 × 179 | ≥159 [LOW CONF.] |
+| WhatsApp 17.41.45 | 524px, RMS 0.42px (16 views) | 13.07 cm/u (depth-ratio) | 222 × 151 | ≥122 [LOW CONF.] |
+| WhatsApp 09.07.37 | 1052px, RMS 0.70px (42 views) | 9.90 cm/u (depth-ratio) | 186 × 153 | ≥50 [LOW CONF.] |
+
+Two notable changes vs. the previous (post-glob-fix) rerun:
+- **Reprojection RMS roughly doubled** on the videos that already calibrated (IMG_3126:
+  0.32→0.76px, IMG_3128: 0.21→0.78px). This is expected and correct, not a regression:
+  the old RMS was measured against the homography's own smoothed points, so it was
+  structurally close to zero by construction; the new RMS is measured against real
+  detected pixels and reflects genuine detector + lens-model residual.
+- **WhatsApp 09.07.37 now passes the plausibility gate** (1052px, RMS 0.70px, 42 views)
+  where it was previously rejected outright (implausible k1/k2, would have collapsed SfM
+  if fed in). Feeding `cv2.calibrateCamera` the real noisy correspondences instead of the
+  artificially-clean homography reprojections kept the optimizer out of the degenerate
+  distortion-vs-focal-length tradeoff that caused the earlier rejection. **(⚠ This turned
+  out to be a false pass — see DFOV gate fix below.)**
+
+Scale/room numbers also moved a few percent from the prior rerun — consistent with the
+already-documented run-to-run sensitivity of `cv2.calibrateCamera`'s optimizer, on top of
+this correspondence-source change.
+
+### Calibration DFOV gate + ground-truth regression fix — (2026-08-09) ✦ finding
+
+**The bug:** The 2026-08-09 correspondence fix caused WhatsApp 09.07.37's calibration to
+pass the plausibility gate with focal=1052px (k1=0.196, k2=−0.177 — within all existing
+bounds). When fed as fixed intrinsics into COLMAP, this wrong focal caused the SfM
+reconstruction to settle at a scale where the depth-ratio formula returned 9.90 cm/unit
+instead of the correct ~20 cm/unit, making room dimensions ~2.5× too small
+(186×153 cm vs ground-truth 464×237 cm, −60%/−35% error vs −10%/−8% before the fix).
+
+**Root cause, confirmed from DFOV analysis of all calibrated videos:**
+
+| Video | focal | diag | DFOV | verdict |
+|---|---|---|---|---|
+| IMG_3126 | 664px | 1652px | 102.4° | plausible ✓ |
+| IMG_3128 | 720px | 1652px | 97.8° | plausible ✓ |
+| WhatsApp 17.41.45 | 524px | 1175px | 96.6° | plausible ✓ |
+| **WhatsApp 09.07.37** | **1052px** | **1175px** | **58.4°** | **telephoto-zoom range — wrong local minimum** |
+
+The three good calibrations cluster at 97–102°. The bad one is at 58°: the optimizer
+traded a high focal against low distortion on this video's (limited) view diversity,
+producing a geometrically self-consistent but physically wrong lens model that the k1/k2
+and tilt-spread gates could not detect.
+
+**Fix:** `validate_calibration()` in `calibrate_camera.py` now adds a diagonal-FOV
+plausibility check: `65° ≤ DFOV ≤ 130°`. This rejects the 1052px focal (DFOV=58.4°)
+while accepting all three passing videos (97–102°). WhatsApp 09.07.37 falls back to
+self-calibration — the same path that produced −10%/−8% footprint errors before the
+correspondence fix. Rerun with `python run.py dataset/*.mov --calibrate --gpu --force`
+to validate.
+
 ### Known limitations
 - Marker orientation is ambiguous (180° flip) — irrelevant for scale; matters only if the
   marker is later used as a pose/orientation anchor.
@@ -413,6 +487,8 @@ the underlying numbers genuinely aren't reproducible**, unlike the reliable-foot
 - [x] Full pipeline rerun on all 5 videos from a clean `output/` (2026-08-04) — see Results; surfaced a real run-to-run reproducibility gap on IMG_3126's calibration (different `cv2.calibrateCamera` local minimum on an otherwise identical input)
 - [x] Fixed `run.py` to expand glob patterns (e.g. `dataset/*.mov`) itself instead of relying on the shell — cmd.exe/PowerShell pass wildcards through unexpanded (unlike bash), which was silently producing a single literal-`*` "video". Removed the `run`/`run.ps1` wrappers in favor of one `python run.py ...` entry point that works the same in all three shells
 - [x] Third full pipeline rerun, all 5 videos (2026-08-04, post-glob-fix) — see Results; a starker reproducibility data point (WhatsApp 17.41.45's scale moved >3x between same-day runs)
+- [x] Fixed a circular-reprojection bug in calibration/triangulation correspondences: `detect_marker()` now exposes the actual detected `grid_pts_full` instead of `calibrate_camera.py`/`scale_sfm.py` reconstructing points via the homography fit from those same points; full 5-video rerun confirms the effect (RMS roughly doubled on the videos already calibrating — now measuring real detector noise instead of the homography's self-fit; WhatsApp 09.07.37 calibration now passes the plausibility gate where it was previously rejected)
+- [x] **DFOV plausibility gate** added to `calibrate_camera.py` — the 2026-08-09 correspondence fix caused a new failure mode where the optimizer found a wrong local minimum (focal=1052px, DFOV=58°) that passed all prior gates (k1/k2, principal-point, tilt-spread) but produced a 2.5× wrong depth-ratio scale on WhatsApp 09.07.37 (9.90→~20 cm/u expected). New gate rejects `DFOV < 65° or > 130°`; confirmed: 3 good videos at 97–102° pass, the bad one at 58° is rejected → self-cal fallback restores −10%/−8% footprint accuracy. Rerun with `--force` to take effect.
 
 ### In progress
 - [ ] YOLOE evaluation: single-model open-vocab detection+segmentation (text/visual/prompt-free) as 4th benchmark arm vs GDINO+SAM2 / YOLO-World+SAM2 / manual+SAM2 — smoke test running

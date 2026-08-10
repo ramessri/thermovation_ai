@@ -2,7 +2,7 @@
 run.py — end-to-end Thermovation assessment pipeline.
 
   video → frames → SfM → marker metric scale → room dimensions
-  → [wip] placement recommendation (--placement)
+  → room-frame alignment (--align) → [wip] placement recommendation (--placement)
 
 Each stage is cached: if its output already exists it is skipped (use --force
 to redo everything). Multiple videos can be processed in one call and run in
@@ -13,6 +13,7 @@ Usage:
   python run.py dataset/*.mov --parallel 2
   python run.py dataset/video.mp4 --fps 2 --max-dim 1440 --force
   python run.py dataset/*.mov --calibrate --gpu --output output/pipeline_calibrated
+  python run.py dataset/IMG_3126.mov --align       # also build the marker-anchored room frame + top-down
   python run.py dataset/IMG_3126.mov --placement   # also run placement recommendation
 """
 
@@ -53,7 +54,7 @@ def best_sparse_model(sfm_dir: Path) -> Path | None:
 
 
 def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
-                  force: bool, calibrate: bool, gpu: bool, placement: bool) -> dict:
+                  force: bool, calibrate: bool, gpu: bool, align: bool, placement: bool) -> dict:
     stem = video.stem.replace(" ", "_")
     work = out_root / stem
     frames_dir = work / "frames"
@@ -113,7 +114,22 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
     if (sfm_dir / "room_dims.json").exists():
         status["room_dims"] = json.loads((sfm_dir / "room_dims.json").read_text())
 
-    # 6. placement recommendation (opt-in via --placement; best-effort — skip if no clean wall)
+    # 6. room-frame alignment (opt-in via --align; best-effort — needs marker_triangulation
+    #    scale, so it's a no-op for videos that fell back to depth_ratio scaling)
+    if align:
+        topdown_path = sfm_dir / "aligned_room" / "topdown.png"
+        if force or not topdown_path.exists():
+            for script in ["05_alignment/align_world.py", "05_alignment/align_room.py"]:
+                res = subprocess.run(
+                    [str(c) for c in [PY, script, sfm_dir]], cwd=ROOT)
+                if res.returncode != 0:
+                    print(f"[{stem}:align] {script} errored (non-fatal)")
+        if topdown_path.exists():
+            status["aligned_room_topdown"] = str(topdown_path)
+        else:
+            status["align_skipped"] = True
+
+    # 7. placement recommendation (opt-in via --placement; best-effort — skip if no clean wall)
     if placement:
         placement_json = sfm_dir / "placement_3d.json"
         if force or not placement_json.exists():
@@ -169,6 +185,10 @@ def print_summary(results: list[dict]) -> None:
             bound = ">=" if dims.get("height_is_lower_bound") else ""
             print(f"  room : L={dims['length_cm']:.0f}cm  W={dims['width_cm']:.0f}cm  "
                   f"H={bound}{dims['height_cm']:.0f}cm")
+        if r.get("aligned_room_topdown"):
+            print(f"  align: room frame + top-down saved to {r['aligned_room_topdown']}")
+        elif r.get("align_skipped"):
+            print("  align: skipped (needs marker_triangulation scale, not depth_ratio_fallback)")
         placement = r.get("placement")
         if placement and placement.get("top3"):
             best = placement["top3"][0]
@@ -192,6 +212,9 @@ def main():
                              "(fixes focal length instead of self-calibrating)")
     parser.add_argument("--gpu", action="store_true",
                         help="Use CUDA for SfM feature extraction/matching/mapping")
+    parser.add_argument("--align", action="store_true",
+                        help="Also build the marker-anchored, gravity-up room frame + "
+                             "top-down floor plan (needs marker_triangulation scale)")
     parser.add_argument("--placement", action="store_true",
                         help="Also run the placement recommendation stage "
                              "(default: pipeline stops after room dimensions)")
@@ -217,6 +240,8 @@ def main():
                 cmd.append("--calibrate")
             if args.gpu:
                 cmd.append("--gpu")
+            if args.align:
+                cmd.append("--align")
             if args.placement:
                 cmd.append("--placement")
             procs.append((v, subprocess.Popen(cmd, cwd=ROOT)))
@@ -227,7 +252,7 @@ def main():
         return
 
     results = [process_video(v, args.output, args.fps, args.max_dim, args.force,
-                             args.calibrate, args.gpu, args.placement)
+                             args.calibrate, args.gpu, args.align, args.placement)
                for v in args.videos]
     print_summary(results)
 

@@ -46,11 +46,9 @@ def detect_in_registered_frames(rec: pycolmap.Reconstruction, frames_dir: Path) 
         bgr = cv2.imread(str(frames_dir / img.name))
         if bgr is None:
             continue
-        px_per_cm, corners, H, _ = detect_marker(bgr)
+        px_per_cm, corners, _, pts, _ = detect_marker(bgr)
         if px_per_cm is None:
             continue
-        pts = cv2.perspectiveTransform(
-            GRID_CM.reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
         cam = rec.cameras[img.camera_id]
         P = np.asarray(img.cam_from_world().matrix())      # 3x4 world->cam
         norm_xy = np.asarray(cam.cam_from_img(pts.astype(np.float64)))

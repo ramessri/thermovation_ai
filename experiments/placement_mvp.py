@@ -199,7 +199,7 @@ def main():
     h, w = bgr.shape[:2]
 
     if args.auto_scale:
-        px_per_cm, marker_corners, _, debug_img = detect_marker(bgr, debug=True)
+        px_per_cm, marker_corners, _, _, debug_img = detect_marker(bgr, debug=True)
         if px_per_cm is None:
             raise RuntimeError(
                 "Fiducial marker not detected. Check lighting/focus or use manual scale."
