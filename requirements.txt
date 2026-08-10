@@ -4,6 +4,7 @@ torchvision
 numpy
 opencv-python
 Pillow
+python-dotenv
 
 # detection
 transformers>=4.44.0    # GroundingDINO via AutoModelForZeroShotObjectDetection
