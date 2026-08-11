@@ -91,10 +91,31 @@ def triangulate_dlt(observations: list[tuple[np.ndarray, np.ndarray]]) -> np.nda
     for (x, y), P in observations:
         rows.append(x * P[2] - P[0])
         rows.append(y * P[2] - P[1])
-    A = np.stack(rows)
-    _, _, vt = np.linalg.svd(A)
+    A = np.stack(rows).astype(np.float64, copy=False)
+    if not np.all(np.isfinite(A)):
+        return None
+    try:
+        _, _, vt = np.linalg.svd(A, full_matrices=False)
+    except np.linalg.LinAlgError:
+        # Fall back to a more robust solver path when SVD fails.
+        # Try a small regularized jitter first, then normal equations.
+        vt = None
+        for eps in [1e-8, 1e-6, 1e-4, 1e-3]:
+            try:
+                jitter = np.random.default_rng(0).normal(scale=eps, size=A.shape)
+                _, _, vt = np.linalg.svd(A + jitter, full_matrices=False)
+                break
+            except np.linalg.LinAlgError:
+                continue
+        if vt is None:
+            at_a = A.T @ A
+            try:
+                _, v = np.linalg.eigh(at_a + np.eye(at_a.shape[0]) * 1e-12)
+                vt = v.T
+            except np.linalg.LinAlgError:
+                return None
     X = vt[-1]
-    if abs(X[3]) < 1e-12:
+    if not np.isfinite(X).all() or abs(X[3]) < 1e-12:
         return None
     return X[:3] / X[3]
 
