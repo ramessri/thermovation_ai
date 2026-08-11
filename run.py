@@ -8,25 +8,38 @@ Each stage is cached: if its output already exists it is skipped (use --force
 to redo everything). Multiple videos can be processed in one call and run in
 parallel worker processes (--parallel N).
 
+DATASET_DIR and OUTPUT_DIR can be set in a .env file (see .env.example) so
+paths don't need to be retyped on every call. Video args without a path
+separator (e.g. "IMG_3126.mov") resolve against DATASET_DIR; anything with
+a slash/backslash or an absolute path is used as-is.
+
 Usage:
+  python run.py IMG_3126.mov
   python run.py dataset/IMG_3126.mov
-  python run.py dataset/*.mov --parallel 2
-  python run.py dataset/video.mp4 --fps 2 --max-dim 1440 --force
-  python run.py dataset/*.mov --calibrate --gpu --output output/pipeline_calibrated
-  python run.py dataset/IMG_3126.mov --align       # also build the marker-anchored room frame + top-down
-  python run.py dataset/IMG_3126.mov --placement   # also run placement recommendation
+  python run.py "*.mov" --parallel 2
+  python run.py video.mp4 --fps 2 --max-dim 1440 --force
+  python run.py "*.mov" --calibrate --gpu --output output/pipeline_calibrated
+  python run.py IMG_3126.mov --align       # also build the marker-anchored room frame + top-down
+  python run.py IMG_3126.mov --placement   # also run placement recommendation
 """
 
 import argparse
 import glob
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 PY = sys.executable
 ROOT = Path(__file__).parent
+DEFAULT_DATASET_DIR = Path(os.environ.get("DATASET_DIR", "dataset"))
+DEFAULT_OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output/pipeline"))
 
 
 def sh(cmd: list, log_prefix: str) -> None:
@@ -200,8 +213,14 @@ def print_summary(results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="End-to-end assessment pipeline")
-    parser.add_argument("videos", nargs="+", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("output/pipeline"))
+    parser.add_argument("videos", nargs="+",
+                        help="Video file(s) or glob pattern(s). A bare name with no "
+                             "path separator resolves against --dataset.")
+    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_DIR,
+                        help=f"Folder bare video names resolve against (default: "
+                             f"{DEFAULT_DATASET_DIR}, or DATASET_DIR in .env)")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR,
+                        help=f"default: {DEFAULT_OUTPUT_DIR}, or OUTPUT_DIR in .env")
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--max-dim", type=int, default=1440)
     parser.add_argument("--parallel", type=int, default=1,
@@ -220,12 +239,17 @@ def main():
                              "(default: pipeline stops after room dimensions)")
     args = parser.parse_args()
 
+    # Bare names (no path separator) resolve against --dataset; anything
+    # with a slash/backslash or an absolute path is used as typed.
+    resolved = [v if (os.path.isabs(v) or "/" in v or "\\" in v) else str(args.dataset / v)
+                for v in args.videos]
+
     # cmd.exe/PowerShell don't expand wildcards like bash does, so expand
     # any unexpanded glob patterns (e.g. "dataset/*.mov") ourselves.
     videos = []
-    for v in args.videos:
-        matches = sorted(Path(p) for p in glob.glob(str(v)))
-        videos.extend(matches if matches else [v])
+    for v in resolved:
+        matches = sorted(Path(p) for p in glob.glob(v))
+        videos.extend(matches if matches else [Path(v)])
     args.videos = videos
 
     if args.parallel > 1 and len(args.videos) > 1:

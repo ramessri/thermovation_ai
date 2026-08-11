@@ -3,6 +3,9 @@ Boilers.coco
 dataset
 output
 
+# Local machine config
+.env
+
 # Python
 __pycache__
 *.pyc
