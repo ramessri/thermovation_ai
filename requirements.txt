@@ -8,7 +8,7 @@ python-dotenv
 
 # detection
 transformers>=4.44.0    # GroundingDINO via AutoModelForZeroShotObjectDetection
-ultralytics             # YOLO-World
+ultralytics             # YOLO-World + YOLOE 
 
 # segmentation
 sam2                    # Meta SAM2 (pip install sam2)

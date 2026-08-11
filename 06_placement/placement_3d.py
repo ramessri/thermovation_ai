@@ -42,6 +42,10 @@ INVALID_P3D = 2**63 - 1
 
 # ── Rücklauf localization (blue-marking cue) ─────────────────────────────────
 
+BLUE_HSV_LOW = (95, 90, 60)
+BLUE_HSV_HIGH = (130, 255, 255)
+
+
 def blue_circle_candidates(bgr: np.ndarray) -> list[dict]:
     """Small blue circular caps/rings (German convention: blue = return flow).
 
@@ -50,7 +54,7 @@ def blue_circle_candidates(bgr: np.ndarray) -> list[dict]:
     NOT be blue.
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (95, 90, 60), (130, 255, 255))
+    mask = cv2.inRange(hsv, BLUE_HSV_LOW, BLUE_HSV_HIGH)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
@@ -96,17 +100,29 @@ def depth_from_covisible(rec: pycolmap.Reconstruction, img, px: float, py: float
 
 
 def locate_rucklauf(rec: pycolmap.Reconstruction, frames_dir: Path,
-                    override: tuple[str, float, float] | None) -> tuple[np.ndarray, str, tuple]:
-    """Best blue-circle cue across registered frames, lifted to 3D."""
+                    override: tuple[str, float, float] | None,
+                    cm_per_unit: float,
+                    pipe_candidate: dict | None = None,
+                    agree_threshold_cm: float = 30.0) -> tuple[np.ndarray, str | None, tuple | None, str]:
+    """Best Rücklauf 3D estimate, combining the blue-cap cue with the
+    pipe-color-pairing signal (07_pipes/pipe_paths.py) when available.
+
+    Returns (X, frame_name_or_None, px_py_or_None, confidence), where
+    confidence is 'manual' (explicit override), 'high' (both signals agree
+    within agree_threshold_cm), 'medium' (only one signal available), or
+    'low' (both available but disagree — blue-cap result is used, since a
+    successful circular-cap detection is the stronger single cue, but the
+    disagreement is reported rather than hidden).
+    """
     if override:
         name, px, py = override
         img = next(im for im in rec.images.values() if im.name == name)
         X = depth_from_covisible(rec, img, px, py)
         if X is None:
             raise RuntimeError("No co-visible 3D points near the manual Rücklauf pixel")
-        return X, name, (px, py)
+        return X, name, (px, py), "manual"
 
-    best = None
+    blue_result = None
     for img in sorted(rec.images.values(), key=lambda im: im.name):
         bgr = cv2.imread(str(frames_dir / img.name))
         if bgr is None:
@@ -115,16 +131,38 @@ def locate_rucklauf(rec: pycolmap.Reconstruction, frames_dir: Path,
             X = depth_from_covisible(rec, img, c["px"], c["py"])
             if X is None:
                 continue
-            if best is None or c["strength"] > best[0]:
-                best = (c["strength"], X, img.name, (c["px"], c["py"]), c)
-    if best is None:
-        raise RuntimeError(
-            "No blue Rücklauf cue found in any registered frame. "
-            "Provide --rucklauf-frame/--rucklauf-px manually."
-        )
-    print(f"Rücklauf cue: {best[2]} at ({best[3][0]:.0f},{best[3][1]:.0f}) "
-          f"circularity={best[4]['circularity']:.2f}")
-    return best[1], best[2], best[3]
+            if blue_result is None or c["strength"] > blue_result[0]:
+                blue_result = (c["strength"], X, img.name, (c["px"], c["py"]))
+
+    pipe_X = None
+    if pipe_candidate and pipe_candidate.get("rucklauf_xyz_model") is not None:
+        pipe_X = np.array(pipe_candidate["rucklauf_xyz_model"])
+
+    if blue_result is not None and pipe_X is not None:
+        _, bx, bname, bpx = blue_result
+        agree_cm = float(np.linalg.norm(bx - pipe_X)) * cm_per_unit
+        if agree_cm < agree_threshold_cm:
+            print(f"Rücklauf cue: {bname} at ({bpx[0]:.0f},{bpx[1]:.0f}) — "
+                  f"blue-cap and pipe-pairing agree within {agree_cm:.0f}cm, high confidence")
+            return bx, bname, bpx, "high"
+        print(f"Rücklauf: blue-cap ({bname}) and pipe-pairing DISAGREE by "
+              f"{agree_cm:.0f}cm — low confidence, using blue-cap")
+        return bx, bname, bpx, "low"
+
+    if blue_result is not None:
+        _, bx, bname, bpx = blue_result
+        print(f"Rücklauf cue: {bname} at ({bpx[0]:.0f},{bpx[1]:.0f}) "
+              "[blue-cap only, medium confidence]")
+        return bx, bname, bpx, "medium"
+
+    if pipe_X is not None:
+        print("Rücklauf: pipe-color-pairing only (no blue-cap cue found), medium confidence")
+        return pipe_X, None, None, "medium"
+
+    raise RuntimeError(
+        "No blue Rücklauf cue and no pipe-pairing candidate found. "
+        "Provide --rucklauf-frame/--rucklauf-px manually, or run 07_pipes/pipe_paths.py first."
+    )
 
 
 # ── wall frame from the triangulated marker ──────────────────────────────────
@@ -284,7 +322,13 @@ def main():
     override = None
     if args.rucklauf_frame and args.rucklauf_px:
         override = (args.rucklauf_frame, args.rucklauf_px[0], args.rucklauf_px[1])
-    ruck_X, ruck_frame, ruck_px = locate_rucklauf(rec, args.frames_dir, override)
+    pipe_lengths_path = args.sfm_dir / "pipe_lengths.json"
+    pipe_candidate = None
+    if pipe_lengths_path.exists():
+        pipe_data = json.loads(pipe_lengths_path.read_text())
+        pipe_candidate = pipe_data.get("rucklauf_pipe_pairing")
+    ruck_X, ruck_frame, ruck_px, ruck_confidence = locate_rucklauf(
+        rec, args.frames_dir, override, cm_per_unit, pipe_candidate)
 
     # wall plane: triangulated marker if available, else RANSAC the vertical wall
     # nearest the Rücklauf (robust when the marker sits on multiple surfaces)
@@ -490,7 +534,8 @@ def main():
     out = dict(cm_per_unit=cm_per_unit,
                unit_wh_cm=[W, H],
                rucklauf=dict(model_xyz=ruck_X.tolist(), frame=ruck_frame,
-                             px=list(ruck_px)),
+                             px=list(ruck_px) if ruck_px else None,
+                             confidence=ruck_confidence),
                wall=dict(origin_model=origin.tolist(), u=u_ax.tolist(),
                          v=v_ax.tolist(), normal=n_ax.tolist()),
                floor_z_cm=z_floor,

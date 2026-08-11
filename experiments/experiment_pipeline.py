@@ -100,6 +100,14 @@ def load_yolo_world():
     return model
 
 
+def load_yoloe(device: str):
+    from ultralytics import YOLOE
+    model = YOLOE.from_pretrained("jameslahm/yoloe-11s-seg")
+    model.to(device)
+    print("  YOLOE loaded (yoloe-11s-seg, HF checkpoint)")
+    return model
+
+
 # ── detectors ────────────────────────────────────────────────────────────────
 
 def detect_gdino(image_rgb: np.ndarray, processor, model,
@@ -133,6 +141,24 @@ def detect_yolo_world(image_rgb: np.ndarray, model,
     class_ids = results.boxes.cls.cpu().tolist()
     labels = [classes[int(c)] for c in class_ids]
     return boxes, labels, scores
+
+
+def detect_yoloe(image_rgb: np.ndarray, model, classes: list[str],
+                 threshold: float) -> tuple[np.ndarray, list[str], list[float], list[np.ndarray]]:
+    model.set_classes(classes, model.get_text_pe(classes))
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    results = model.predict(bgr, conf=threshold, verbose=False)[0]
+    boxes = results.boxes.xyxy.cpu().numpy()
+    scores = results.boxes.conf.cpu().tolist()
+    class_ids = results.boxes.cls.cpu().tolist()
+    labels = [classes[int(c)] for c in class_ids]
+    masks = []
+    if results.masks is not None:
+        h, w = image_rgb.shape[:2]
+        for m in results.masks.data.cpu().numpy():
+            masks.append(cv2.resize(m.astype(np.uint8), (w, h),
+                                    interpolation=cv2.INTER_NEAREST))
+    return boxes, labels, scores, masks
 
 
 # ── SAM2 prediction ───────────────────────────────────────────────────────────
@@ -235,6 +261,36 @@ def run_yoloworld_mode(images: list[dict], img_dir: Path, img_to_anns,
     return results
 
 
+def run_yoloe_mode(images: list[dict], img_dir: Path, img_to_anns,
+                   yoloe_model, classes: list[str], threshold: float,
+                   output_dir: Path) -> list[dict]:
+    """YOLOE is single-model open-vocab detect+segment — no SAM2 step,
+    its own masks are what gets scored as the 4th arm."""
+    results = []
+    for img_info in images:
+        img_path = img_dir / img_info["file_name"]
+        bgr = cv2.imread(str(img_path))
+        if bgr is None:
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        t0 = time.perf_counter()
+        boxes, labels, scores, masks = detect_yoloe(rgb, yoloe_model, classes, threshold)
+        det_ms = (time.perf_counter() - t0) * 1000
+
+        stem = Path(img_info["file_name"]).stem
+        if len(boxes):
+            save_result(bgr, boxes, masks, labels, scores,
+                        output_dir / "yoloe" / f"{stem}_yoloe.jpg")
+
+        record = dict(file=img_info["file_name"], detections=len(boxes),
+                      det_ms=round(det_ms, 1), seg_ms=0.0)
+        results.append(record)
+        print(f"  [yoloe] {img_info['file_name']}: {len(boxes)} det  "
+              f"det+seg={det_ms:.0f}ms")
+    return results
+
+
 def run_manual_mode(images: list[dict], img_dir: Path, img_to_anns: dict,
                     id_to_cat: dict, sam2_pred,
                     output_dir: Path) -> list[dict]:
@@ -284,7 +340,7 @@ def main():
                         choices=["train", "test", "valid"],
                         help="Dataset split")
     parser.add_argument("--mode", default="all",
-                        choices=["all", "gdino", "yoloworld", "manual"],
+                        choices=["all", "gdino", "yoloworld", "yoloe", "manual"],
                         help="Which pipeline mode(s) to run")
     parser.add_argument("--n", type=int, default=None,
                         help="Limit to first N images (useful for quick tests)")
@@ -320,17 +376,20 @@ def main():
 
     run_gdino = args.mode in ("all", "gdino")
     run_yolo  = args.mode in ("all", "yoloworld")
+    run_yoloe = args.mode in ("all", "yoloe")
     run_manual = args.mode in ("all", "manual")
 
     # Load SAM2 once (shared across modes)
     print("Loading models...")
     sam2_pred = load_sam2(device)
 
-    gdino_proc = gdino_model = yolo_model = None
+    gdino_proc = gdino_model = yolo_model = yoloe_model = None
     if run_gdino:
         gdino_proc, gdino_model = load_gdino(device)
     if run_yolo:
         yolo_model = load_yolo_world()
+    if run_yoloe:
+        yoloe_model = load_yoloe(device)
     print()
 
     summary = {}
@@ -350,6 +409,14 @@ def main():
             images, img_dir, img_to_anns,
             yolo_model, sam2_pred,
             yolo_classes, args.threshold, output_dir,
+        )
+        print()
+
+    if run_yoloe:
+        print(f"=== Mode 4: YOLOE (single-model detect+segment)  (classes: {yolo_classes}) ===")
+        summary["yoloe"] = run_yoloe_mode(
+            images, img_dir, img_to_anns,
+            yoloe_model, yolo_classes, args.threshold, output_dir,
         )
         print()
 
