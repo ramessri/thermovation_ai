@@ -2,6 +2,7 @@
 Boilers.coco
 dataset
 output
+merged
 
 # Local machine config
 .env
@@ -10,6 +11,9 @@ output
 __pycache__
 *.pyc
 *.pt
+
+#ts
+*.ts
 
 # Docs (for LLM assisted coding)
 CLAUDE.md

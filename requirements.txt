@@ -21,3 +21,4 @@ matplotlib
 
 # Roboflow inference (from earlier step)
 inference-sdk
+roboflow                # upload_to_roboflow.py (SDK upload of merged pipe proposals for review)

@@ -102,9 +102,9 @@ def load_yolo_world():
 
 def load_yoloe(device: str):
     from ultralytics import YOLOE
-    model = YOLOE.from_pretrained("jameslahm/yoloe-11s-seg")
+    model = YOLOE("yoloe-11s-seg.pt")
     model.to(device)
-    print("  YOLOE loaded (yoloe-11s-seg, HF checkpoint)")
+    print("  YOLOE loaded (yoloe-11s-seg.pt)")
     return model
 
 
