@@ -89,7 +89,7 @@ def build_obstacle_mask(image_rgb: np.ndarray, device: str,
     for m in sam2_from_boxes(sam2_pred, image_rgb, boxes):
         mask |= (m.squeeze() > 0).astype(np.uint8)
 
-    yolo_model = load_yolo_world()
+    yolo_model = load_yolo_world(device)
     boxes, _, _ = detect_yolo_world(image_rgb, yolo_model, yolo_classes, threshold)
     for m in sam2_from_boxes(sam2_pred, image_rgb, boxes):
         mask |= (m.squeeze() > 0).astype(np.uint8)

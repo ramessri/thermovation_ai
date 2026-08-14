@@ -31,7 +31,7 @@ def main():
 
     sam2_pred = load_sam2(device)
     gdino_proc, gdino_model = load_gdino(device)
-    yolo_model = load_yolo_world()
+    yolo_model = load_yolo_world(device)
     yolo_classes = [c.strip() for c in args.yolo_classes.split(",")]
 
     summary = {"gdino": [], "yoloworld": []}

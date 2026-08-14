@@ -243,7 +243,7 @@ def load_detector_models(detector: str, device: str) -> dict:
     if detector == "gdino":
         models["gdino_proc"], models["gdino_model"] = load_gdino(device)
     elif detector == "yoloworld":
-        models["yoloworld"] = load_yolo_world()
+        models["yoloworld"] = load_yolo_world(device)
     elif detector == "yoloe":
         models["yoloe"] = load_yoloe(device)
     return models

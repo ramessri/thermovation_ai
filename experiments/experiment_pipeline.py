@@ -93,10 +93,11 @@ def load_gdino(device: str):
     return processor, model
 
 
-def load_yolo_world():
+def load_yolo_world(device: str, checkpoint: str = "yolov8s-worldv2.pt"):
     from ultralytics import YOLO
-    model = YOLO("yolov8s-worldv2.pt")
-    print("  YOLO-World loaded (yolov8s-worldv2)")
+    model = YOLO(checkpoint)
+    model.to(device)
+    print(f"  YOLO-World loaded ({checkpoint})")
     return model
 
 
@@ -387,7 +388,7 @@ def main():
     if run_gdino:
         gdino_proc, gdino_model = load_gdino(device)
     if run_yolo:
-        yolo_model = load_yolo_world()
+        yolo_model = load_yolo_world(device)
     if run_yoloe:
         yoloe_model = load_yoloe(device)
     print()
