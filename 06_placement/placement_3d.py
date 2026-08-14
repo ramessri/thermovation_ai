@@ -33,9 +33,7 @@ import pycolmap
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "05_geometry"))
-sys.path.insert(0, str(_ROOT / "04_scale"))
 from room_dims import load_filtered_points, up_from_cameras, rotation_to_z, density_peak
-from scale_sfm import detect_in_registered_frames
 
 INVALID_P3D = 2**63 - 1
 
@@ -246,45 +244,6 @@ def wall_frame_ransac(pts_model, up_world, ref_model, z_floor_cm, cm_per_unit,
     return origin, u, v, n, best_inl
 
 
-def wall_frame_from_sightings(rec, sightings, up_world):
-    """
-    Wall plane from SfM points inside the marker footprint, fitted robustly.
-
-    Used when the marker itself couldn't be triangulated (small/distant marker,
-    depth-ratio scale). The marker lies flat on the wall, so well-triangulated
-    SfM points projecting inside its footprint define the wall plane directly.
-    Returns (origin, u, v, n, marker_center) or None.
-    """
-    name_to_img = {im.name: im for im in rec.images.values()}
-    xyz = []
-    for s in sightings:
-        img = name_to_img[s["name"]]
-        mcx, mcy = s["pts"][4]
-        radius = 0.6 * float(np.ptp(s["pts"], axis=0).max())
-        for p2d in img.points2D:
-            pid = p2d.point3D_id
-            if pid == INVALID_P3D or pid not in rec.points3D:
-                continue
-            if np.hypot(p2d.xy[0] - mcx, p2d.xy[1] - mcy) < radius:
-                xyz.append(rec.points3D[pid].xyz)
-    if len(xyz) < 20:
-        return None
-    P = np.asarray(xyz)
-    origin = P.mean(axis=0)
-    # robust plane: fit, reject far points, refit
-    for _ in range(3):
-        _, _, vt = np.linalg.svd(P - origin)
-        n = vt[-1]
-        resid = np.abs((P - origin) @ n)
-        keep = resid < max(2.5 * np.median(resid), 1e-6)
-        if keep.sum() < 20:
-            break
-        P = P[keep]
-        origin = P.mean(axis=0)
-    origin, u, v, n = _axes_from_normal(origin, n, up_world)
-    return origin, u, v, n, P.mean(axis=0)
-
-
 def main():
     parser = argparse.ArgumentParser(description="3D placement recommendation on the marker wall")
     parser.add_argument("sfm_dir", type=Path)
@@ -332,12 +291,10 @@ def main():
 
     # wall plane: triangulated marker if available, else RANSAC the vertical wall
     # nearest the Rücklauf (robust when the marker sits on multiple surfaces)
-    sightings = None
     if scale_info.get("segments"):
         origin, u_ax, v_ax, n_ax = marker_wall_frame(scale_info, up)
         wall_source = "triangulated marker"
     else:
-        sightings = detect_in_registered_frames(rec, args.frames_dir)
         pts_model = load_filtered_points(rec)
         wf = wall_frame_ransac(pts_model, up, ruck_X, z_floor, cm_per_unit)
         if wf is None:

@@ -22,7 +22,6 @@ import json
 from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
 
 from experiment_pipeline import load_coco_split, load_sam2, load_gdino, load_yolo_world, load_yoloe

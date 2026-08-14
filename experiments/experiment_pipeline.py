@@ -185,7 +185,6 @@ def sam2_from_boxes(predictor, image_rgb: np.ndarray,
 def load_coco_split(dataset_dir: Path, split: str) -> tuple[list[dict], dict, dict]:
     ann_file = dataset_dir / split / "_annotations.coco.json"
     data = json.loads(ann_file.read_text())
-    id_to_img = {img["id"]: img for img in data["images"]}
     id_to_cat = {cat["id"]: cat["name"] for cat in data["categories"]}
     img_to_anns: dict[int, list] = {}
     for ann in data["annotations"]:
