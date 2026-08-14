@@ -16,6 +16,34 @@ sam2                    # Meta SAM2 (pip install sam2)
 # structure-from-motion
 pycolmap
 
+# alternate 3D reconstruction (3d_recons_alternatives/) — gsplat's own
+# examples/simple_trainer.py isn't in the pip package, clone it from
+# https://github.com/nerfstudio-project/gsplat; nerfstudio installs its own
+# ns-train/ns-process-data/ns-export CLI tools. See 3d_recons_alternatives/README.md
+gsplat
+nerfstudio
+plyfile                 # parses gsplat's --save_ply and nerfstudio's ns-export .ply
+
+# MASt3R feed-forward reconstruction (3d_recons_alternatives/mast3r_reconstruct.py)
+# — not pip-installable, clone and install its own requirements.txt files:
+#   git clone --recursive https://github.com/naver/mast3r.git
+#   pip install -r mast3r/requirements.txt -r mast3r/dust3r/requirements.txt
+# then add the cloned mast3r/ directory to PYTHONPATH. See 3d_recons_alternatives/README.md
+
+# VGGT feed-forward reconstruction (3d_recons_alternatives/vggt_reconstruct.py)
+# — also clone-based, not a plain pip package:
+#   git clone https://github.com/facebookresearch/vggt.git
+#   pip install -r vggt/requirements.txt
+# then add the cloned vggt/ directory to PYTHONPATH. Checkpoint (facebook/VGGT-1B)
+# downloads automatically via VGGT.from_pretrained(). See 3d_recons_alternatives/README.md
+
+# monocular metric depth (08_depth/) — DepthAnythingV2-Metric, ZoeDepth,
+# DepthPro all load via transformers (already above), no extra install.
+# MetricAnything needs its own repo (not pip-installable):
+#   git clone https://github.com/metric-anything/metric-anything.git
+# and that repo's directory added to PYTHONPATH. Depth Anything 3 is pip-installable:
+depth-anything-3        # DA3Metric — see 08_depth/README.md
+
 # visualization
 matplotlib
 

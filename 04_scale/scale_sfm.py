@@ -221,12 +221,64 @@ def main():
     parser = argparse.ArgumentParser(description="Solve metric scale of a COLMAP model via the marker")
     parser.add_argument("model_dir", type=Path, help="Sparse model dir (e.g. output/sfm/X/sparse/1)")
     parser.add_argument("frames_dir", type=Path, help="Directory with the registered frames")
+    parser.add_argument("--scale-method", default="auto",
+                        choices=["auto", "marker", "depth_ratio", "monocular_depth"],
+                        help="'auto' (default) is the existing marker-first/depth-ratio-fallback "
+                             "pipeline behavior and writes scale.json as always. The other three "
+                             "force one specific method for direct comparison against 'auto' on "
+                             "the same video, and write to a separate scale_<method>.json instead "
+                             "of overwriting the scale.json the rest of the pipeline depends on.")
+    parser.add_argument("--depth-model", default="depthanything_v2_metric",
+                        choices=["depthanything_v2_metric", "zoedepth", "depthpro",
+                                "metric_anything", "depth_anything_v3"],
+                        help="Only used with --scale-method monocular_depth — see 08_depth/README.md")
     args = parser.parse_args()
 
     rec = pycolmap.Reconstruction(str(args.model_dir))
     print(f"Model: {rec.num_reg_images()} images, {rec.num_points3D()} points")
 
+    if args.scale_method == "monocular_depth":
+        import sys
+        import torch
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "08_depth"))
+        from depth_scale import monocular_depth_scale
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        result = monocular_depth_scale(rec, args.frames_dir, args.depth_model, device)
+        if result is None:
+            print("FAILED: monocular depth scale — too few usable point ratios")
+            return
+        print(f"Monocular depth scale [{args.depth_model}]: {result['cm_per_unit']:.4f} cm/unit  "
+              f"(frames={result['frames_used']}, points={result['points_used']}, "
+              f"core CV={result['core_cv_pct']}%)")
+        out_path = args.model_dir.parent.parent / f"scale_monocular_depth_{args.depth_model}.json"
+        out_path.write_text(json.dumps(dict(
+            model_dir=str(args.model_dir), method="monocular_depth", **result,
+        ), indent=2))
+        print(f"Saved {out_path}")
+        return
+
+    out_name = "scale.json" if args.scale_method == "auto" else f"scale_{args.scale_method}.json"
     sightings = detect_in_registered_frames(rec, args.frames_dir)
+
+    if args.scale_method == "depth_ratio":
+        fb = depth_ratio_scale(rec, sightings)
+        if fb is None:
+            print("FAILED: depth-ratio scale — no reliable estimate")
+            return
+        print(f"Depth-ratio scale : {fb['cm_per_unit']:.4f} cm/unit  "
+              f"(frames={fb['frames_used']}, core CV={fb['core_cv_pct']}%)")
+        out_path = args.model_dir.parent.parent / out_name
+        out_path.write_text(json.dumps(dict(
+            model_dir=str(args.model_dir),
+            cm_per_unit=fb["cm_per_unit"],
+            method="depth_ratio_fallback",
+            depth_ratio_frames=fb["frames_used"],
+            depth_ratio_core_cv_pct=fb["core_cv_pct"],
+            segments=[],
+        ), indent=2))
+        print(f"Saved {out_path}")
+        return
+
     segments = split_segments(sightings)
     print(f"Sightings split into {len(segments)} temporal segments "
           f"(marker may be moved between placements)\n")
@@ -252,6 +304,10 @@ def main():
         accepted.append(result)
 
     if not accepted:
+        if args.scale_method == "marker":
+            print("FAILED: marker triangulation gave no reliable segment "
+                  "(--scale-method marker forces this method, no fallback)")
+            return
         print("\nMarker triangulation gave no reliable segment — "
               "trying depth-ratio fallback (small/distant marker)...")
         fb = depth_ratio_scale(rec, sightings)
@@ -260,7 +316,7 @@ def main():
             return
         print(f"Depth-ratio scale : {fb['cm_per_unit']:.4f} cm/unit  "
               f"(frames={fb['frames_used']}, core CV={fb['core_cv_pct']}%)")
-        out_path = args.model_dir.parent.parent / "scale.json"
+        out_path = args.model_dir.parent.parent / out_name
         out_path.write_text(json.dumps(dict(
             model_dir=str(args.model_dir),
             cm_per_unit=fb["cm_per_unit"],
@@ -283,7 +339,7 @@ def main():
         print(f"Cross-segment agreement: {cross_spread:.2f}% spread "
               f"(independent placements — this is the real accuracy check)")
 
-    out_path = args.model_dir.parent.parent / "scale.json"
+    out_path = args.model_dir.parent.parent / out_name
     out_path.write_text(json.dumps(dict(
         model_dir=str(args.model_dir),
         cm_per_unit=final_scale,

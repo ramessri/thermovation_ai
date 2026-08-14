@@ -106,16 +106,20 @@ def density_peak(vals: np.ndarray, lo_pct: float, hi_pct: float,
     return float((edges[i] + edges[i + 1]) / 2)
 
 
-def gravity_rotation(rec: pycolmap.Reconstruction, pts_cm: np.ndarray) -> tuple[np.ndarray, float | None]:
+def gravity_rotation_from_prior(up_prior: np.ndarray, pts_cm: np.ndarray) -> tuple[np.ndarray, float | None]:
     """
     Rotation taking world -> gravity-aligned (+Z up), refined on floor inliers.
 
-    `pts_cm` are the filtered sparse points already scaled to centimeters.
-    Returns (R, z_floor) where z_floor is the floor height in the resulting
-    frame (pts_cm @ R.T), or None if the floor density peak couldn't be
-    localized.
+    Takes the up-vector prior directly rather than a pycolmap.Reconstruction,
+    so it's reusable for any metric point cloud + prior — not just SfM's own
+    (see gravity_rotation below for the SfM entry point, and
+    3d_recons_alternatives/gaussians_to_room_dims.py for a 3DGS one).
+
+    `pts_cm` are the filtered points already scaled to centimeters. Returns
+    (R, z_floor) where z_floor is the floor height in the resulting frame
+    (pts_cm @ R.T), or None if the floor density peak couldn't be localized.
     """
-    up = up_from_cameras(rec)
+    up = up_prior
     for _ in range(2):
         R = rotation_to_z(up)
         z = (pts_cm @ R.T)[:, 2]
@@ -135,30 +139,29 @@ def gravity_rotation(rec: pycolmap.Reconstruction, pts_cm: np.ndarray) -> tuple[
     return R, z_floor
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Room dimensions from scaled SfM model")
-    parser.add_argument("sfm_dir", type=Path,
-                        help="SfM output dir containing sparse/<i> and scale.json")
-    parser.add_argument("--model", default="1", help="Sparse model index (default 1)")
-    args = parser.parse_args()
+def gravity_rotation(rec: pycolmap.Reconstruction, pts_cm: np.ndarray) -> tuple[np.ndarray, float | None]:
+    """SfM entry point: gravity prior from camera poses, refined on floor inliers."""
+    return gravity_rotation_from_prior(up_from_cameras(rec), pts_cm)
 
-    scale_info = json.loads((args.sfm_dir / "scale.json").read_text())
-    cm_per_unit = scale_info["cm_per_unit"]
-    rec = pycolmap.Reconstruction(str(args.sfm_dir / "sparse" / args.model))
-    print(f"Model: {rec.num_reg_images()} images, {rec.num_points3D()} points")
-    print(f"Scale: {cm_per_unit:.4f} cm/unit")
 
-    pts = load_filtered_points(rec) * cm_per_unit
-    print(f"Filtered points: {len(pts)}")
+def compute_room_dims(pts_cm: np.ndarray, R: np.ndarray, z_floor: float,
+                      cam_centers_cm: np.ndarray) -> tuple[dict, dict]:
+    """
+    Height (gap-based ceiling detection) + footprint (largest-connected-
+    cluster min-area rect) from a gravity-aligned, scaled point cloud.
 
-    # align gravity to +Z (prior from cameras, refined on floor inliers)
-    R, z_floor = gravity_rotation(rec, pts)
-    ptsR = pts @ R.T
+    Shared by every reconstruction-method arm (SfM here, 3D Gaussian
+    Splatting in 3d_recons_alternatives/) so they're judged by identical
+    math — a difference in the resulting numbers reflects the underlying
+    geometry, not a divergence between two hand-rolled implementations.
 
+    Returns (metrics, geometry): metrics is the JSON-safe dict shape
+    room_dims.json has always had (minus cm_per_unit, which the caller
+    already has and adds itself); geometry holds the numpy arrays a
+    top-down render needs (see render_topdown).
+    """
+    ptsR = pts_cm @ R.T
     z = ptsR[:, 2]
-    if z_floor is None:
-        print("FAILED: could not localize the floor density peak")
-        return
     n_floor = int(np.sum(np.abs(z - z_floor) < 5))
 
     z_ceil, n_ceil, height, height_is_lower_bound = None, 0, None, False
@@ -201,14 +204,8 @@ def main():
     else:
         height = float(np.percentile(z, 99.5) - z_floor)
         height_is_lower_bound = True
-        print("WARNING: no gap-separated ceiling band found (topmost points "
-              "are contiguous with the general equipment/pipe mass, not a "
-              "distinct plane) — height reported as a LOWER BOUND. "
-              "Re-film including floor-wall-ceiling junctions (see protocol).")
 
-    # camera height above floor as a plausibility cue
-    cam_z = np.array([img.projection_center() for img in rec.images.values()])
-    cam_z = ((cam_z * cm_per_unit) @ R.T)[:, 2]
+    cam_z = (cam_centers_cm @ R.T)[:, 2]
     cam_height = float(np.median(cam_z) - z_floor)
 
     # footprint: percentile-trimmed top-down projection, largest connected
@@ -223,33 +220,40 @@ def main():
     cluster_mask = largest_cluster_mask(xy_trimmed)
     xy_t = xy_trimmed[cluster_mask]
     z_t = z_trimmed[cluster_mask]
-    (rcx, rcy), (rw, rh), angle = cv2.minAreaRect(xy_t.reshape(-1, 1, 2))
+    rect = cv2.minAreaRect(xy_t.reshape(-1, 1, 2))
+    (rcx, rcy), (rw, rh), angle = rect
     length, width = max(rw, rh), min(rw, rh)
 
     footprint_reliable = len(xy_t) >= MIN_FOOTPRINT_PTS
     height_reliable = (not height_is_lower_bound
                        and n_floor >= MIN_FLOOR_PTS and n_ceil >= MIN_CEIL_PTS)
 
-    bound = ">= " if height_is_lower_bound else ""
-    flag_h = "" if height_reliable else "  [LOW CONFIDENCE]"
-    flag_f = "" if footprint_reliable else "  [LOW CONFIDENCE]"
-    print(f"\nRoom height : {bound}{height:.1f} cm   "
-          f"(floor peak {n_floor} pts, ceiling peak {n_ceil} pts){flag_h}")
-    print(f"Room length : {length:.1f} cm{flag_f}")
-    print(f"Room width  : {width:.1f} cm{flag_f}")
-    print(f"Camera height above floor (median): {cam_height:.0f} cm")
-    print(f"Footprint rectangle angle: {angle:.1f} deg")
-    print(f"Footprint cluster size: {len(xy_t)} / {int(trimmed.sum())} trimmed points "
-          f"(largest connected component)")
-    if not footprint_reliable:
-        print(f"WARNING: footprint support ({len(xy_t)} pts) below the "
-              f"{MIN_FOOTPRINT_PTS}-point confidence threshold — L/W likely unreliable.")
-    if not height_reliable and not height_is_lower_bound:
-        print(f"WARNING: floor/ceiling support (floor={n_floor}, ceiling={n_ceil}) "
-              f"below confidence thresholds ({MIN_FLOOR_PTS}/{MIN_CEIL_PTS}) — "
-              "height likely unreliable despite a numeric ceiling match.")
+    metrics = dict(
+        height_cm=round(height, 1),
+        height_is_lower_bound=height_is_lower_bound,
+        height_reliable=height_reliable,
+        length_cm=round(float(length), 1),
+        width_cm=round(float(width), 1),
+        footprint_reliable=footprint_reliable,
+        floor_z_cm=round(z_floor, 1),
+        ceiling_z_cm=None if z_ceil is None else round(z_ceil, 1),
+        floor_peak_points=n_floor, ceiling_peak_points=n_ceil,
+        camera_height_cm=round(cam_height, 1),
+        points_used=int(len(xy_t)),
+        points_trimmed=int(trimmed.sum()),
+    )
+    geometry = dict(lo=lo, hi=hi, xy_t=xy_t, z_t=z_t, rect=rect, height=height)
+    return metrics, geometry
 
-    # top-down visualization
+
+def render_topdown(geometry: dict, R: np.ndarray, z_floor: float, cm_per_unit: float,
+                   cam_centers_cm: np.ndarray, marker_segments: list[dict] | None,
+                   out_path: Path) -> None:
+    """Top-down floor-plan visualization, shared across reconstruction methods."""
+    lo, hi, xy_t, z_t = geometry["lo"], geometry["hi"], geometry["xy_t"], geometry["z_t"]
+    (rcx, rcy), (rw, rh), angle = geometry["rect"]
+    height = geometry["height"]
+
     CANVAS, MARGIN = 900, 60
     span = max(hi[0] - lo[0], hi[1] - lo[1])
     s = (CANVAS - 2 * MARGIN) / span
@@ -266,39 +270,95 @@ def main():
     box = cv2.boxPoints(((rcx, rcy), (rw, rh), angle))
     for i in range(4):
         cv2.line(canvas, to_px(box[i]), to_px(box[(i + 1) % 4]), (0, 160, 0), 2)
-    # camera trajectory
-    centers = np.array([img.projection_center() for img in rec.images.values()])
-    centers = (centers * cm_per_unit) @ R.T
+    centers = cam_centers_cm @ R.T
     for c in centers:
         cv2.circle(canvas, to_px(c[:2]), 2, (0, 200, 255), -1)
-    # accepted marker placements
-    for seg in scale_info.get("segments", []):
+    for seg in (marker_segments or []):
         mp = np.array(list(seg["marker_points_model"].values()), dtype=np.float64)
         mc = (mp.mean(axis=0) * cm_per_unit) @ R.T
         cv2.drawMarker(canvas, to_px(mc[:2]), (255, 0, 255), cv2.MARKER_STAR, 18, 2)
-    cv2.putText(canvas, f"L={length:.0f}cm  W={width:.0f}cm  H={height:.0f}cm",
+    cv2.putText(canvas, f"L={rw if rw>rh else rh:.0f}cm  W={rw if rw<rh else rh:.0f}cm  H={height:.0f}cm",
                 (MARGIN, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
 
-    viz_path = args.sfm_dir / "room_topdown.png"
-    cv2.imwrite(str(viz_path), canvas)
+    cv2.imwrite(str(out_path), canvas)
 
-    out = dict(
-        cm_per_unit=cm_per_unit,
-        height_cm=round(height, 1),
-        height_is_lower_bound=height_is_lower_bound,
-        height_reliable=height_reliable,
-        length_cm=round(float(length), 1),
-        width_cm=round(float(width), 1),
-        footprint_reliable=footprint_reliable,
-        floor_z_cm=round(z_floor, 1),
-        ceiling_z_cm=None if z_ceil is None else round(z_ceil, 1),
-        floor_peak_points=n_floor, ceiling_peak_points=n_ceil,
-        camera_height_cm=round(cam_height, 1),
-        points_used=int(len(xy_t)),
-        points_trimmed=int(trimmed.sum()),
-    )
-    (args.sfm_dir / "room_dims.json").write_text(json.dumps(out, indent=2))
-    print(f"\nSaved {args.sfm_dir / 'room_dims.json'}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Room dimensions from scaled SfM model")
+    parser.add_argument("sfm_dir", type=Path,
+                        help="SfM output dir containing sparse/<i> and scale.json")
+    parser.add_argument("--model", default="1", help="Sparse model index (default 1)")
+    parser.add_argument("--scale-json", type=Path, default=None,
+                        help="Override which scale file to use (default: <sfm_dir>/scale.json, "
+                             "the marker/Zhang-derived one). Point this at e.g. "
+                             "<sfm_dir>/scale_monocular_depth_<model>.json (see "
+                             "08_depth/depth_scale.py) to compute room dimensions from the SAME "
+                             "SfM point cloud but a depth-model-derived scale instead — isolates "
+                             "whether the scale source or the geometry is doing the work. Output "
+                             "then goes to room_dims_<scale-file-stem>.json instead of "
+                             "room_dims.json, so it never overwrites the marker-based result.")
+    args = parser.parse_args()
+
+    scale_path = args.scale_json or (args.sfm_dir / "scale.json")
+    scale_info = json.loads(scale_path.read_text())
+    cm_per_unit = scale_info["cm_per_unit"]
+    rec = pycolmap.Reconstruction(str(args.sfm_dir / "sparse" / args.model))
+    print(f"Model: {rec.num_reg_images()} images, {rec.num_points3D()} points")
+    print(f"Scale: {cm_per_unit:.4f} cm/unit (from {scale_path.name}, method={scale_info.get('method')})")
+
+    pts = load_filtered_points(rec) * cm_per_unit
+    print(f"Filtered points: {len(pts)}")
+
+    # align gravity to +Z (prior from cameras, refined on floor inliers)
+    R, z_floor = gravity_rotation(rec, pts)
+    if z_floor is None:
+        print("FAILED: could not localize the floor density peak")
+        return
+
+    cam_centers_cm = np.array([img.projection_center() for img in rec.images.values()]) * cm_per_unit
+    metrics, geometry = compute_room_dims(pts, R, z_floor, cam_centers_cm)
+
+    if metrics["height_is_lower_bound"]:
+        print("WARNING: no gap-separated ceiling band found (topmost points "
+              "are contiguous with the general equipment/pipe mass, not a "
+              "distinct plane) — height reported as a LOWER BOUND. "
+              "Re-film including floor-wall-ceiling junctions (see protocol).")
+
+    bound = ">= " if metrics["height_is_lower_bound"] else ""
+    flag_h = "" if metrics["height_reliable"] else "  [LOW CONFIDENCE]"
+    flag_f = "" if metrics["footprint_reliable"] else "  [LOW CONFIDENCE]"
+    _, _, angle = geometry["rect"]
+    print(f"\nRoom height : {bound}{metrics['height_cm']:.1f} cm   "
+          f"(floor peak {metrics['floor_peak_points']} pts, "
+          f"ceiling peak {metrics['ceiling_peak_points']} pts){flag_h}")
+    print(f"Room length : {metrics['length_cm']:.1f} cm{flag_f}")
+    print(f"Room width  : {metrics['width_cm']:.1f} cm{flag_f}")
+    print(f"Camera height above floor (median): {metrics['camera_height_cm']:.0f} cm")
+    print(f"Footprint rectangle angle: {angle:.1f} deg")
+    print(f"Footprint cluster size: {metrics['points_used']} / {metrics['points_trimmed']} "
+          f"trimmed points (largest connected component)")
+    if not metrics["footprint_reliable"]:
+        print(f"WARNING: footprint support ({metrics['points_used']} pts) below the "
+              f"300-point confidence threshold — L/W likely unreliable.")
+    if not metrics["height_reliable"] and not metrics["height_is_lower_bound"]:
+        print(f"WARNING: floor/ceiling support (floor={metrics['floor_peak_points']}, "
+              f"ceiling={metrics['ceiling_peak_points']}) below confidence thresholds "
+              "(150/80) — height likely unreliable despite a numeric ceiling match.")
+
+    if args.scale_json:
+        dims_name = f"room_dims_{scale_path.stem}.json"
+        viz_name = f"room_topdown_{scale_path.stem}.png"
+    else:
+        dims_name, viz_name = "room_dims.json", "room_topdown.png"
+
+    viz_path = args.sfm_dir / viz_name
+    render_topdown(geometry, R, z_floor, cm_per_unit, cam_centers_cm,
+                   scale_info.get("segments"), viz_path)
+
+    out = dict(cm_per_unit=cm_per_unit, scale_source=scale_info.get("method"), **metrics)
+    dims_path = args.sfm_dir / dims_name
+    dims_path.write_text(json.dumps(out, indent=2))
+    print(f"\nSaved {dims_path}")
     print(f"Saved {viz_path}")
 
 
