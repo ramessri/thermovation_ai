@@ -448,6 +448,236 @@ self-calibration — the same path that produced −10%/−8% footprint errors b
 correspondence fix. Rerun with `python run.py dataset/*.mov --calibrate --gpu --force`
 to validate.
 
+### Larger real dataset + GPU upgrade (2026-08-18/20)
+
+The working dataset grew well past the original 5 videos: `DATASET_DIR` now points at
+**34 real customer boiler-room videos**. Two full calibrated batch runs exist
+(`sfm 1`: 24/34 completed SfM+scale+dims, 18/24 passed the calibration plausibility gate;
+`sfm 2`: an independent rerun, 23/34 completed, 12/23 calibrated). Where the same video
+appears in both, numbers differ a few percent — the same `cv2.calibrateCamera`
+reproducibility gap documented above, not a new bug. Dev GPU upgraded
+**GTX 1650 4GB → RTX 3080 10GB**, unblocking real parallelism headroom and making the
+NeRF/3DGS/MASt3R/VGGT comparison below practical for the first time.
+
+### Pipe extraction visualization bug: wrong-photo scribbles from unrelated frames — fix (2026-08-18)
+
+**The bug:** `07_pipes/pipe_paths.py`'s overlay (`pipe_paths.jpg`) drew every detected
+pipe cluster's centerline onto a single, arbitrarily-chosen frame ("whichever frame came
+first alphabetically that had any pipe mask"), with no check that a given cluster was
+actually observed there. Since there's no mesh/depth buffer — only a sparse point
+cloud — a cluster triangulated from a completely different wall could still
+mathematically reproject in-bounds on an unrelated photo and get drawn as if it belonged.
+Confirmed on IMG_3126: the overlay showed scribbles across a closet door with zero real
+pipes, while the actual visible ceiling pipe wasn't highlighted at all. Root-caused via a
+diagnostic script isolating raw GDINO output on the problem frame (only 2 real boxes,
+neither near the door) — proved the scribbles were reprojected from other frames'
+detections, not local false positives.
+
+**Fix:** added per-cluster frame provenance tracking
+(`fuse_masks_to_point_ids_with_provenance`) so each cluster records exactly which
+frame(s) actually put one of its points inside a pipe mask. The visualization now picks
+the single frame that maximizes clusters it BOTH observed AND can reproject in-bounds,
+and only draws clusters passing both tests — clusters with no valid frame are correctly
+left undrawn rather than forced onto a wrong photo. Re-verified on IMG_3126: went from
+14/14 clusters drawn nonsensically on an empty door to 8/14 clusters drawn correctly on
+the boiler/ceiling pipework (the other 6 simply have no frame satisfying both
+conditions — an honest result, not a regression). Also added a `--pipe-prompt` CLI arg
+(the prompt string was previously hardcoded to `"pipe"`, so a better-performing phrasing
+found by `sweep_prompts.py` couldn't actually be used).
+
+### Segmentation threshold sweep resolved — YOLO-World ruled out for pipes (2026-08-18)
+
+`experiments/sweep_prompts.py` (5 phrasings × 3 thresholds × 2 arms) answers the earlier
+open question of why YOLO-World/YOLOE found ~0 "pipe" detections:
+
+- **YOLO-World: genuinely dead for "pipe".** Zero true positives across every phrasing
+  ("pipe", "metal pipe", "heating pipe", "pipeline", "copper pipe") and every threshold
+  down to 0.05 — not a tunable-in-this-range threshold problem. Ruled out as a pipe
+  detector.
+- **YOLOE: usable second opinion.** Best config found: `prompt="heating pipe",
+  threshold=0.05` → P=0.186, R=0.2 (tp=8/40) — still well below GDINO's known R=0.525
+  (21/40 at `threshold=0.25`, `prompt="pipe"`). GDINO stays primary/default.
+
+A formal `compare_arms.py` run with these settings (full mIoU/precision/recall table
+across all arms) is still open — the sweep only reports pipe-class P/R per
+phrasing/threshold, not the complete comparison table.
+
+### room_dims.py memory bug: unbounded SVD on dense point clouds (2026-08-20)
+
+**The bug:** `gravity_rotation_from_prior()` called `np.linalg.svd(floor_pts - c)`
+without `full_matrices=False`. Harmless on SfM's sparse clouds (thousands of points), but
+the moment a DENSE point cloud is fed through this same function — as every one of the
+new dense-reconstruction arms below does (monocular depth, 3DGS, NeRF all route through
+`compute_room_dims()`) — full SVD tries to materialize the complete N×N `U` matrix:
+133,296 floor points → attempted allocation of **132 GB**, immediate crash. Only the 3×3
+`Vt` (the plane normal) was ever used. **Fix:** added `full_matrices=False`. This was the
+one risky SVD call in the codebase — the rest (`pipe_paths.py`, `scale_sfm.py`,
+`placement_3d.py`, `align_world.py`) all operate on ≤9 marker points or other tiny inputs,
+already safe.
+
+### MetricAnything run natively — no marker, no SfM, no calibration file (2026-08-18/20)
+
+Separate from the SfM-anchored depth work below: a standalone test of how close a single
+monocular metric-depth model, run completely on its own with zero calibration, can get to
+real room dimensions — the "how bad is scale-free monocular depth" baseline.
+
+**Two real bugs found and fixed in `08_depth/depth_models.py`'s `predict_metric_anything`
+before it could even run once:** it called the model's raw `forward()`, which requires an
+exact `img_size × img_size` input and returns scale-*ambiguous* depth — crashes on any
+non-square image, and was never actually exercised before now. Fixed to call the real
+entry point, `model.infer(x, f_px=...)`, which resizes internally and produces genuine
+metric depth via `inverse_depth = canonical_inverse_depth × (width / f_px)`. Also added
+the official ImageNet preprocessing normalization, which the original version omitted.
+With no real camera calibration available, `f_px` uses the model card's own documented
+fallback: image width in pixels.
+
+**A new script, `08_depth/metric_anything_room_dims.py`**, backprojects each sampled
+frame independently (single-image only — no cross-frame pose alignment, since that would
+require SfM) into a heuristic L×W×H via percentile extents (robust, not raw min/max — the
+same lesson `room_dims.py` already learned about outlier clusters). A video's estimate is
+the MEDIAN across ~10 sampled frames; full per-frame spread is kept in the output JSON
+rather than hidden.
+
+**A non-obvious, exactly-derivable property of this design:** because the script uses the
+*same* `f_px` value for both the model's metric depth-scaling step and its own pinhole
+backprojection's `fx`/`fy`, that value cancels out algebraically in the height and width
+formulas — those two are mathematically **invariant** to whatever `f_px` is chosen, given
+this construction. Only `length` (raw depth/Z) scales with it. Verified against IMG_3126's
+real calibrated `fx=698px`: plugging in the real value would not fix height/width at all,
+and would shrink length further from ground truth (real fx < the width-fallback
+assumption), not closer. So the undershoot below isn't primarily a wrong-focal-length
+problem — it traces to the network's own raw scale prediction and to the "level camera"
+(no gravity solve, since there's no multi-view pose to derive one from) assumption being
+violated on these orbit-walk, frequently-tilted captures.
+
+**Batch run, all 35 videos with extracted frames** (`--frames-root`, 10 sampled frames
+each): a genuinely noisy heuristic, as expected — most videos land in a plausible-ish
+50–200cm range, several (Rupert_Goetschl, Stefan_Schiesser, both WhatsApp 17.41.xx clips,
+Wolfgang_Kraus) land at 300–640cm, well past any real boiler-room scale, tracing to the
+same two known failure modes (tilted frames, network scale drift). IMG_3126 specifically:
+H=101/L=201/W=85cm heuristic vs. H≥135/L=450/W=213 (SfM+marker) vs. H=235/L=525/W=152
+(true ground truth) — undershoots on all three axes relative to both other sources.
+Results: `08_depth/results_metric_anything/summary.json` + per-video breakdowns.
+
+Two operational fixes needed along the way, applicable to any future GPU batch script
+here: (1) `torch.cuda.empty_cache()` after every frame — without it, VRAM crept toward
+the 10GB ceiling over the course of ~200+ inferences and the job silently stalled (100%
+GPU utilization, zero throughput — thrashing, not a hang); (2) resume/skip-existing logic
+keyed on each video's already-written output file, since Python's stdout buffering when
+piped to a log file had been silently hiding real progress, making a stalled job
+indistinguishable from a merely-quiet one until directly checked.
+
+### Ceiling check, SfM-anchored monocular depth, across all videos (2026-08-20)
+
+Extended `08_depth/ceiling_check.py` (previously single-video-only) to batch mode with
+auto sparse-model selection, the same resume/cache-clearing fixes as above, and
+resilience to a single video's crash (a NaN/Inf depth value on a degenerate pixel — not
+filtered by the original `d > 1e-3` check, since NaN comparisons are silently `False` —
+propagated into `density_peak()`'s `np.arange`, which cannot compute a length from NaN
+bounds; killed the whole batch on video 3 before a defensive finite-value filter was
+added). Ran `depthanything_v2_metric` across all 35 videos: 24 succeeded (11 lack
+`scale.json` from the original `sfm 1` run — a prerequisite this script can't work
+around; 1 had no sparse model at all).
+
+**Every single one of the 24 still reports `height_is_lower_bound: true`** — none cross
+the strict "reliable AND not-a-lower-bound" bar required to call a ceiling genuinely
+recovered, matching the honest, non-triumphant framing this project already committed to
+after the ceiling-detection bug fix above. But the height *number* moved substantially in
+most cases, generally upward toward more plausible values (IMG_3126: ≥138→≥231cm, true
+235cm — 1.7% off; IMG_3128: ≥112→≥239cm; Klaus_Rombergg: ≥118→≥222cm). Not uniformly a
+win: a few videos moved the *wrong* direction (Christian_Heimes 204→152,
+Dominik_Lindhorst 114→95, Leif_Malluche 187→171), and one result is clearly unreliable
+(WhatsApp 17.41.49 → 627cm off just 9 sampled frames). **Honest finding:** dense
+monocular depth, anchored to SfM's real camera poses and marker scale, reliably pushes
+height estimates in the right direction — sometimes dramatically — but doesn't clear the
+reliability bar on this real-world dataset. A genuine partial improvement, not a fix.
+Results: `08_depth/results/ceiling_check_all/summary.json`.
+
+### 3D reconstruction comparison environment — set up, not yet run (2026-08-20)
+
+Installed the full `3d_recons_alternatives/` stack: `gsplat` + `nerfstudio` (`ns-train`/
+`ns-process-data`/`ns-export` all present), and MASt3R + VGGT cloned to
+`C:\thermovation-repos\` with their own requirements installed. Two real environment
+snags hit and fixed along the way, documented here since they'll recur on any fresh
+setup:
+
+- **nerfstudio's `fpsample` dependency needs a C++ compiler** (CMake/nmake) not present on
+  this machine, and its newest version (1.0.2) ships no Windows wheel. Fix: pre-install
+  the last version that does (`pip install fpsample==0.3.3`) before installing
+  `nerfstudio`, so pip's resolver never attempts the from-source build. No admin rights /
+  Visual Studio Build Tools install needed.
+- **VGGT's `requirements.txt` silently downgraded the shared environment** — `torch`
+  2.13.0→2.3.1 (and to a CPU-only build, dropping CUDA entirely), `numpy`→1.26.1 —
+  breaking `sam2` (needs torch≥2.5.1) and several other packages mid-session. Recovered
+  via `pip install --force-reinstall --no-deps torch torchvision --index-url
+  https://download.pytorch.org/whl/cu132` (matching the installed CUDA 13.2 toolkit
+  exactly — `pip install torch torchvision --index-url ...` alone reported "already
+  satisfied" without noticing the installed build was CPU-only, since pip's requirement
+  check doesn't distinguish local version tags like `+cu132` from `+cpu` for an
+  already-satisfied version string). **Lesson: any future package here with its own
+  `torch`-pinning `requirements.txt` should be installed in isolation (a dedicated venv),
+  not into the shared environment.**
+
+Separately noticed, unrelated to the above: `pycolmap.has_cuda` currently reports
+`False` in this environment (file timestamp confirms it wasn't touched by either
+incident) — a pre-existing, dynamic runtime CUDA-preload check, not a reinstall issue.
+Doesn't block anything above (none of the new tools touch pycolmap's own CUDA path), but
+is a real, still-open discrepancy worth investigating before relying on `run_sfm.py
+--gpu`'s reported speedup again.
+
+### Full depth-model sweep, SfM-anchored ceiling check — 4/5 models (2026-08-20)
+
+Ran all `08_depth/ceiling_check.py`-compatible depth models across the same 24-video
+batch, each fed the video's **real calibrated focal length** (from `cam.params[0]`, not
+a guessed one — this is the SfM-anchored path, distinct from the standalone
+no-calibration heuristic above). Two more real bugs found and fixed along the way:
+
+- **ZoeDepth's HF processor needs an extra argument DA2-Metric's/DepthPro's don't
+  accept.** `post_process_depth_estimation()` requires either `source_sizes` or
+  `do_remove_padding=False` (it pads internally and needs the pre-padding size to
+  remove it again) — passing that same kwarg to DA2-Metric's or DepthPro's processor
+  raises `TypeError` (their signatures don't have the parameter at all). Fixed via
+  runtime signature inspection in `_predict_hf_depth_cm()` rather than hardcoding
+  per-model branches, since all three share this one call site.
+- **`depth-anything-3`'s package structure doesn't match its own model card.**
+  `from depth_anything_3 import DepthAnything3` (what the original code — and the model
+  card — implied) fails; the class actually lives at `depth_anything_3.api.DepthAnything3`.
+  Fixed the import. But this exposed something bigger: DA3's real `forward()` takes a 5D
+  `(batch, sequence-of-views, C, H, W)` tensor and jointly predicts depth **and** poses
+  **and** its own scale factor across multiple views at once (`Prediction` output has
+  `extrinsics`/`intrinsics`/`scale_factor`/`conf`/`gaussians`) — architecturally a
+  multi-view reconstruction model (closer to VGGT/MASt3R than to the other four
+  single-image depth models here), not a drop-in per-frame depth predictor. Properly
+  wrapping it needs a multi-view-batch integration, not the current per-frame
+  `predict_fn(image_rgb) -> depth_cm` interface every other model here uses. **Left
+  unintegrated — a real, documented gap, not attempted further this session** (also two
+  minor missing pip deps discovered along the way: `addict`, not declared in DA3's own
+  metadata; and its `numpy<2` pin was overridden to keep numpy 2.x for the rest of the
+  environment, without apparent issue).
+
+**Batch results, IMG_3126 (the best-characterized video, true height=235cm), all four
+working models — a genuinely useful side-by-side:**
+
+| Model | Height (cm) | vs SfM's ≥138cm | vs true 235cm |
+|---|---|---|---|
+| SfM only (baseline) | ≥138 [not reliable] | — | −41% |
+| DepthAnythingV2-Metric | ≥231 [not reliable] | +67% | **−1.7%** |
+| ZoeDepth | ≥224 [not reliable] | +62% | −4.7% |
+| DepthPro | ≥222 [not reliable] | +61% | −5.5% |
+| MetricAnything (real calib.) | ≥78 [not reliable] | **−43%** | −67% |
+
+Across all 24 videos, this pattern holds directionally: **DA2-Metric, ZoeDepth, and
+DepthPro cluster together**, each pushing height up from SfM's lower bound in most cases
+(DepthPro the most volatile of the three — mostly reasonable but with two catastrophic
+outliers: Monika_Mulock at 648m, Albert_Mayer at 67m length, both clearly degenerate
+single-frame failures, not representative). **MetricAnything is the outlier of the four**
+— it moved height *down*, often below SfM's own already-conservative lower bound, on
+14 of 17 comparable videos. None of the four ever cleared the strict reliability gate on
+any video (see the standalone ceiling-check section above for why that gate exists and
+what it's protecting against). Full results: `08_depth/results/ceiling_check_all/`,
+`..._zoedepth/`, `..._depthpro/`, `..._metric_anything/`, each with a `summary.json` and
+per-video breakdowns.
+
 ### Known limitations
 - Marker orientation is ambiguous (180° flip) — irrelevant for scale; matters only if the
   marker is later used as a pose/orientation anchor.
@@ -491,13 +721,19 @@ to validate.
 - [x] **DFOV plausibility gate** added to `calibrate_camera.py` — the 2026-08-09 correspondence fix caused a new failure mode where the optimizer found a wrong local minimum (focal=1052px, DFOV=58°) that passed all prior gates (k1/k2, principal-point, tilt-spread) but produced a 2.5× wrong depth-ratio scale on WhatsApp 09.07.37 (9.90→~20 cm/u expected). New gate rejects `DFOV < 65° or > 130°`; confirmed: 3 good videos at 97–102° pass, the bad one at 58° is rejected → self-cal fallback restores −10%/−8% footprint accuracy. Rerun with `--force` to take effect.
 
 ### In progress
-- [ ] YOLOE evaluation: single-model open-vocab detection+segmentation (text/visual/prompt-free) as 4th benchmark arm vs GDINO+SAM2 / YOLO-World+SAM2 / manual+SAM2 — smoke test running
+- [x] Depth-model sweep for the ceiling check: `depthanything_v2_metric`, `zoedepth`,
+      `depthpro`, `metric_anything` all run across the full 24-video batch (see Results
+      — comparison table + per-model findings). `depth_anything_v3` left unintegrated —
+      real architectural mismatch (multi-view model, not a per-frame depth predictor),
+      documented as a known gap, not a quick fix
+- [ ] Formal `compare_arms.py` run with the sweep's resolved GDINO/YOLOE settings (full
+      mIoU/precision/recall table across arms — YOLO-World can now be reported as ruled out)
 - [ ]  Test whether real capture technique fixes the height-recovery failure
 
 ### Next (rough priority order)
-- [ ] Pipe paths & lengths: SAM2/YOLOE pipe masks → skeletonization → back-projection onto 3D model
+- [x] Pipe paths & lengths: SAM2/YOLOE pipe masks → skeletonization → back-projection onto 3D model (`07_pipes/pipe_paths.py`, see visualization-bug fix above)
 - [ ] Quantitative segmentation metrics (mIoU / precision / recall vs Boilers COCO GT)
-- [ ] NeRF / 3D Gaussian Splatting on the same scenes; compare vs SfM (accuracy, runtime, robustness) — GPU is now available for this
+- [ ] NeRF / 3D Gaussian Splatting / MASt3R / VGGT comparison on IMG_3126 + 09.07.37 — environment fully set up (see above), no runs yet
 - [ ] Robustness experiments: lighting / occlusion / reflective-surface analysis across resolution tiers
 - [ ] Ruler-verify the printed marker's true size (printer scaling risk, still outstanding)
 - [ ] End-to-end MVP: video in → scaled geometry + placement recommendation + report out
@@ -507,4 +743,4 @@ to validate.
 ## Environment
 
 - Windows 11, Python: OpenCV, PyTorch, pycolmap (CUDA-enabled)
-- GPU: NVIDIA GTX 1650 4GB - dev PC
+- GPU: NVIDIA RTX 3080 10GB - dev PC (upgraded 2026-08-20 from GTX 1650 4GB)

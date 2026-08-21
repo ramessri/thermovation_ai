@@ -49,7 +49,16 @@ def _load_hf_depth_model(model_id: str, device: str):
 def _predict_hf_depth_cm(image_rgb: np.ndarray, loaded, device: str) -> np.ndarray:
     """image_rgb -> per-pixel metric depth in cm, resized back to input resolution.
 
-    All three HF models here output metric depth in METERS."""
+    All three HF models here output metric depth in METERS.
+
+    ZoeDepth's processor (unlike DA2-Metric's/DepthPro's) *requires* either
+    `source_sizes` or `do_remove_padding=False` in post_process_depth_estimation
+    — it applies internal padding before inference and needs to know the
+    pre-padding size to remove it again. DA2-Metric/DepthPro's processors
+    don't accept that kwarg at all (TypeError if passed), so this is
+    detected per-processor via signature inspection rather than hardcoded,
+    since all three share this one call site."""
+    import inspect
     import torch
     from PIL import Image as PILImage
 
@@ -58,8 +67,13 @@ def _predict_hf_depth_cm(image_rgb: np.ndarray, loaded, device: str) -> np.ndarr
     inputs = processor(images=pil_img, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
+    target_sizes = [(image_rgb.shape[0], image_rgb.shape[1])]
+    post_kwargs = dict(target_sizes=target_sizes)
+    sig_params = inspect.signature(processor.post_process_depth_estimation).parameters
+    if "source_sizes" in sig_params:
+        post_kwargs["source_sizes"] = target_sizes
     depth_m = processor.post_process_depth_estimation(
-        outputs, target_sizes=[(image_rgb.shape[0], image_rgb.shape[1])]
+        outputs, **post_kwargs
     )[0]["predicted_depth"]
     return depth_m.cpu().numpy().astype(np.float64) * 100.0   # m -> cm
 
@@ -94,31 +108,47 @@ def load_metric_anything(device: str):
     return model
 
 
-def predict_metric_anything(image_rgb: np.ndarray, model, device: str, **_kwargs) -> np.ndarray:
-    """Returns metric depth in cm. Verify the exact pre/post-processing
-    (input size, output units) against the model repo's own infer.py when
-    you first run this — MetricAnything was published 2026-01-29, its
-    inference API may have changed since this was written."""
+def predict_metric_anything(image_rgb: np.ndarray, model, device: str,
+                            focal_px: float = None, **_kwargs) -> np.ndarray:
+    """Returns metric depth in cm.
+
+    Verified against the model repo's own depth_model.py: the raw
+    `model(x)`/forward() requires an exact img_size x img_size input and
+    returns scale-ambiguous canonical inverse depth — calling it directly
+    (as this function originally did) crashes on any non-square image and
+    was never actually exercised. `model.infer(x, f_px=...)` is the real
+    entry point: it resizes internally and converts to metric depth via
+    `inverse_depth = canonical_inverse_depth * (width / f_px)` — i.e. the
+    metric SCALE of this model's output is literally parametrized by f_px.
+    With no real camera calibration (no Zhang/marker step, no scale.json —
+    this is the whole point of running MetricAnything standalone), we use
+    the model card's own documented fallback: f_px = image width in pixels
+    when no real intrinsics are available. This is a heuristic, not a
+    calibration — treat resulting metric numbers accordingly.
+
+    Also applies the official infer.py preprocessing (ImageNet
+    normalization), which the previous version of this function omitted."""
     import torch
     from torchvision.transforms import v2
 
     h, w = image_rgb.shape[:2]
-    transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
+    if focal_px is None:
+        focal_px = float(w)   # model card's documented fallback
+    transform = v2.Compose([
+        v2.ToImage(), v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
     x = transform(image_rgb).unsqueeze(0).to(device)
     with torch.no_grad():
-        depth_m = model(x)
-    depth_m = torch.nn.functional.interpolate(
-        depth_m if depth_m.dim() == 4 else depth_m.unsqueeze(1), size=(h, w),
-        mode="bilinear", align_corners=False,
-    ).squeeze().cpu().numpy().astype(np.float64)
-    return depth_m * 100.0   # m -> cm
+        depth_m = model.infer(x, f_px=focal_px)["depth"]
+    return depth_m.cpu().numpy().astype(np.float64) * 100.0   # m -> cm
 
 
 # ── Depth Anything 3 Metric (own package) ───────────────────────────────────
 
 def load_depth_anything_v3_metric(device: str):
     """Requires `pip install depth-anything-3`."""
-    from depth_anything_3 import DepthAnything3
+    from depth_anything_3.api import DepthAnything3   # not exported from the top-level package
     model = DepthAnything3.from_pretrained("depth-anything/DA3Metric-Large").to(device).eval()
     print("  Depth Anything 3 Metric (DA3Metric-Large) loaded")
     return model

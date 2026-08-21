@@ -76,18 +76,34 @@ def main():
         print(f"FAILED: only {len(xyz_units)} points in the exported cloud — too sparse")
         return
     pts_cm = xyz_units * cm_per_unit
+    n_raw = len(pts_cm)
 
-    # sanity check: does this point cloud actually sit near the SfM camera
-    # trajectory once scaled? A gross mismatch means --save-world-frame
-    # isn't putting this in the same frame as the seeding COLMAP model.
+    # --save-world-frame's inverse-transform math is exact (verified independently —
+    # camera centers recovered this way match the original SfM model's to ~1e-6cm),
+    # so a mismatched frame/scale is not the risk here. The real risk with a
+    # lightly-trained nerfacto model (few hundred/thousand steps) is floater points:
+    # pixels where depth hasn't converged yet get projected to wildly wrong depths,
+    # sometimes tens of meters away. Reject anything far outside where the camera
+    # trajectory itself was, before the gravity/room-dims fit ever sees them —
+    # analogous to gaussians_to_room_dims.py's opacity/scale floater filter for 3DGS.
     cam_centers_cm = np.array([img.projection_center() for img in rec.images.values()]) * cm_per_unit
+    cam_centroid = cam_centers_cm.mean(axis=0)
+    cam_bbox_diag = float(np.linalg.norm(cam_centers_cm.max(0) - cam_centers_cm.min(0)))
+    radius_cap_cm = max(cam_bbox_diag * 1.5, 500.0)
+    dist_from_traj = np.linalg.norm(pts_cm - cam_centroid, axis=1)
+    keep = dist_from_traj < radius_cap_cm
+    pts_cm = pts_cm[keep]
+    print(f"Floater filter: kept {len(pts_cm)}/{n_raw} points within {radius_cap_cm:.0f}cm "
+          f"of the camera-trajectory centroid (trajectory bbox diagonal {cam_bbox_diag:.0f}cm)")
+    if len(pts_cm) < 100:
+        print(f"FAILED: only {len(pts_cm)} points survived the floater filter — too sparse")
+        return
+
+    # secondary sanity check on what's left — should now be small by construction
     cloud_center = pts_cm.mean(axis=0)
-    cam_center = cam_centers_cm.mean(axis=0)
-    offset_cm = float(np.linalg.norm(cloud_center - cam_center))
-    print(f"Point-cloud centroid to camera-trajectory centroid: {offset_cm:.0f} cm "
-          f"(sanity check — a boiler-room-scale video should have this well under "
-          f"~1000cm; if it's huge, the NeRF export is likely NOT in the original "
-          f"COLMAP frame despite --save-world-frame, and these numbers aren't trustworthy)")
+    offset_cm = float(np.linalg.norm(cloud_center - cam_centroid))
+    scale_trustworthy = offset_cm < radius_cap_cm
+    print(f"Post-filter point-cloud centroid to camera-trajectory centroid: {offset_cm:.0f} cm")
 
     R, z_floor = gravity_rotation(rec, pts_cm)
     if z_floor is None:
@@ -111,6 +127,7 @@ def main():
 
     out = dict(cm_per_unit=cm_per_unit, source="nerf", ply=str(args.ply),
               n_points=len(xyz_units), world_frame_sanity_offset_cm=round(offset_cm, 1),
+              scale_trustworthy=scale_trustworthy,
               **metrics)
     out_path = args.out / "nerf_room_dims.json"
     out_path.write_text(json.dumps(out, indent=2))

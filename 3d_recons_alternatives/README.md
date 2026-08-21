@@ -340,6 +340,161 @@ all on the `--frame-range`-targeted fragment where classical SfM broke —
 succeeding there where SfM couldn't is the robustness angle 9.3 asked for,
 independent of how accurate the resulting dimensions turn out to be.
 
+## 2026-08-20/21 — Full 35-video NeRF + 3DGS batch, no admin rights
+
+Ran both remaining arms (NeRF, 3DGS) across every video in `sfm 1`, not
+just IMG_3126/09.07.37, via `run_nerf_gsplat_batch.py`. Constraint: no
+admin rights on this machine, for either method.
+
+**NeRF** turned out to need no compiler at all — nerfstudio's `nerfacto`
+has a pure-`torch` implementation (`--pipeline.model.implementation torch`)
+that skips `tinycudann`'s CUDA hash-encoding kernel entirely. It only
+needed two portable, no-installer system binaries added to user-level
+`PATH` (not admin, just `[Environment]::SetEnvironmentVariable(...,
+"User")`):
+- ffmpeg: static build from `BtbN/FFmpeg-Builds` GitHub releases
+- COLMAP CLI: portable `colmap-x64-windows-nocuda.zip` from `colmap/colmap`
+  releases (this is the CLI binary `ns-process-data` shells out to — a
+  separate thing from the `pycolmap` Python bindings the rest of this repo
+  already uses)
+
+**3DGS (gsplat)** does need a real C++/CUDA host compiler at JIT-compile
+time for its rasterizer — no way around that. Got one without admin via
+[mmozeiko's `portable-msvc.py`](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977),
+which downloads MSVC + Windows SDK components directly from the same
+Microsoft package feed the VS installer uses, into a plain folder (no
+installer, no registry writes, no admin) — 479MB, `cl.exe` verified
+working standalone before touching gsplat. Two extra fixes were needed
+beyond just having `cl.exe` on `PATH`:
+- CUDA 13.2's headers require the conforming preprocessor:
+  `NVCC_APPEND_FLAGS=-Xcompiler /Zc:preprocessor`, or nvcc dies with a
+  `C1189` fatal error compiling `cccl/cuda/std/__cccl/preprocessor.h`.
+- `torch.utils.cpp_extension`'s build path calls setuptools'
+  `_get_vc_env()`, which tries to *rediscover* MSVC itself via
+  vswhere/registry rather than trusting the `INCLUDE`/`LIB`/`PATH` already
+  set — and fails, since a portable install isn't a registered VS
+  instance. Fixed with `DISTUTILS_USE_SDK=1` and `MSSdk=1`, which are the
+  standard distutils/setuptools vars for "trust the environment, don't
+  auto-detect."
+
+Both fixes are baked into `run_nerf_gsplat_batch.py`'s `gsplat_env()`/
+`nerf_env()` helpers.
+
+Two more real bugs surfaced only once actual training runs completed:
+- `ns-export pointcloud`'s checkpoint load hit PyTorch 2.6+'s new
+  `weights_only=True` default and couldn't unpickle nerfstudio's own
+  checkpoint (`numpy._core.multiarray.scalar` not an allowed global).
+  Patched `nerfstudio/utils/eval_utils.py`'s `torch.load(...)` call to
+  pass `weights_only=False` — safe here since it's always our own
+  just-trained checkpoint, never an untrusted download.
+- Default `ns-export pointcloud` wants the model to predict normals
+  (`normal_method="model_output"`), which plain `nerfacto` doesn't unless
+  trained with predicted normals on. Fixed by passing
+  `--normal-method open3d` (estimates normals from the depth-based point
+  cloud instead of asking the model for them).
+
+**Iteration budgets were deliberately tiny** — `NERF_ITERS=500`,
+`GSPLAT_STEPS=1500`, versus each method's typical default of ~30,000 —
+purely to fit all 35 videos inside the available time window (measured
+~4.8 it/s for NeRF-torch, ~17.5 it/s for gsplat, both steady-state after
+one-time JIT warmup). This is a coverage/pipeline-validation pass, not a
+quality benchmark — see the known limitation below before reading any
+absolute number as ground truth.
+
+### Known issue: NeRF floater points, not a scale bug
+
+The first full run produced obviously-wrong NeRF room dimensions (e.g.
+IMG_3126: 72m ceiling height). The instinctive suspect — nerfstudio's
+`--save-world-frame` flag putting the export in the wrong coordinate
+frame/scale — turned out to be **not the cause**: independently
+reconstructing `transform_poses_to_original_space()`'s math from the CPU
+side (no model/GPU involved) and comparing recovered camera centers
+against the original SfM reconstruction's camera centers matched to
+~1e-6cm, for every registered image. The frame/scale recovery is exact.
+
+The actual cause: at only 500 training steps, `nerfacto`'s density field
+hasn't sharpened around true surfaces yet, so ray-marched depth for a
+meaningful fraction of pixels lands far past the real geometry (a
+well-known early-training NeRF characteristic — density starts spread
+along the ray and only concentrates at the correct depth as training
+progresses). Those far points single-handedly wreck the density-peak-based
+room-dims estimate. Fixed in `nerf_pointcloud_to_room_dims.py` with a
+floater filter: reject any point farther than `max(1.5 × camera-trajectory
+bounding-box diagonal, 500cm)` from the camera-trajectory centroid, before
+the gravity/room-dims fit ever sees it — same spirit as
+`gaussians_to_room_dims.py`'s existing opacity/scale filter for 3DGS
+floaters. IMG_3126 went from 72m to a plausible 4.8m ceiling height after
+the fix; all 10 videos processed before the fix landed were re-run through
+the (cheap, GPU-free) room-dims step only, not retrained.
+
+### Known limitation: systematic NeRF-vs-3DGS bias at these iteration counts
+
+Across all 24 successfully-scaled videos, NeRF's room dimensions come out
+**3-5x larger than gsplat's** for the same video, consistently — too
+uniform across 24 independent reconstructions to be per-video noise. Both
+numbers are plausibly biased in opposite directions, both traceable to the
+same root cause (severe undertraining relative to each method's normal
+iteration count), not an implementation bug in either arm:
+- **NeRF over-estimates**: per the floater discussion above, undertrained
+  density spreads ray-marched depth outward past true surfaces even after
+  the floater filter removes the most extreme outliers — the filter's
+  500cm+ radius cap is generous enough to still admit moderately-biased
+  points.
+- **3DGS under-estimates**: gsplat's Gaussians are seeded directly from
+  the sparse SfM point cloud and grow outward via densification during
+  training; at only 1500 steps they likely haven't finished expanding to
+  the true room extent yet, especially near walls/ceiling far from the
+  seed points.
+
+Net: **treat every number in the table below as a coverage/pipeline
+validation result, not a measurement.** A trustworthy absolute comparison
+needs each method's normal training budget (~30k steps — roughly 40-80x
+more compute per video than this pass used), which is a follow-up task,
+not something this 4-hour, no-admin-rights pass was trying to establish.
+
+### Results — 24/35 videos (11 skipped: SfM reconstructed but marker-scale
+calibration never succeeded for them, `scale.json` missing — a pre-existing
+gap in the earlier `04_scale` stage, out of scope here since there's no
+metric scale to convert to without it)
+
+| video | gsplat L/W/H (cm) | nerf L/W/H (cm) |
+|---|---|---|
+| Albert_Mayer_IMG_1831 | 132/124/65 | 624/424/301 |
+| Andreas__Scholz__VID_20260802_142216161 | 122/92/94 | 597/528/210 |
+| Bjoern-Harald_Malluche_Heizraum_Video | 376/169/208 | 1318/1242/471 |
+| Christian__Heimes_IMG_4716 | 266/198/125 | 849/602/203 |
+| Dietmar_Baudisch_VID_20260731_142741 | 209/109/71 | 771/550/201 |
+| Dominik__Lindhorst__PXL_20260731_124618342 | 163/146/58 | 376/351/109 |
+| Friedhelm_Bednarz_VIDEO-2026-08-06-17-56-31 | 336/195/195 | 862/678/244 |
+| Helmut_Schlierf | 207/170/168 | 502/411/217 |
+| IMG_3126 | 124/100/59 | 475/470/188 |
+| IMG_3128 | 135/129/64 | 734/672/238 |
+| Johannes_Steinhauser_VID_20260804_192842 | 131/70/67 | 608/409/232 |
+| Klaus_Rombergg | 116/85/63 | 510/420/140 |
+| Leif_Malluche_20260802_115810 | 281/163/224 | 1455/1268/292 |
+| Manfred_Hahn_IMG_2663 | 99/90/28 | 461/354/190 |
+| Michael_Speth_IMG_4149 | 146/113/72 | 591/536/169 |
+| Monika_Adldinger_20260801_174346 | 114/54/48 | 664/545/214 |
+| Monika__Mulock_IMG_6278 | 114/55/65 | 650/546/167 |
+| Moritz__Schneider_IMG_7306 | 144/86/94 | 610/591/252 |
+| Renate_Hefele_20260802_180013 | 181/112/123 | 327/299/120 |
+| Ulli_Roessle_Heizkeller_Lechermann | 302/252/82 | 690/442/249 |
+| WhatsApp_Video_2026-07-05_at_17.41.45 | 345/159/124 | 566/444/350 |
+| WhatsApp_Video_2026-07-05_at_17.41.49 | 216/154/106 | 452/389/326 |
+| WhatsApp_Video_2026-07-09_at_09.07.37 | 53/42/44 | 514/502/145 |
+| Wolfram_Koestler_VID-20260801-WA0002 | 141/60/123 | 498/439/128 |
+
+All heights are `[LOW CONFIDENCE]`/lower-bound flags per
+`room_dims.py`'s own reliability gates — expected at these iteration
+counts, not a new issue.
+
+### Next step
+
+Re-run both arms at normal iteration budgets (30k steps) on a small subset
+first (e.g. IMG_3126 + 09.07.37, the two videos with real tape-measured
+ground truth) to get one trustworthy NeRF-vs-3DGS-vs-SfM comparison before
+deciding whether it's worth the ~40-80x compute cost to do that for all 24.
+
 For VGGT, success has two independent parts, and it's worth keeping them
 separate rather than collapsing to one verdict: (1) **speed and robustness**
 — does it reconstruct the fragmented section at all, and how does its

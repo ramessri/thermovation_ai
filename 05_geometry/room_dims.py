@@ -131,7 +131,7 @@ def gravity_rotation_from_prior(up_prior: np.ndarray, pts_cm: np.ndarray) -> tup
             break
         # least-squares plane normal of floor inliers
         c = floor_pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(floor_pts - c)
+        _, _, vt = np.linalg.svd(floor_pts - c, full_matrices=False)
         n = vt[-1]
         up = n if n @ up > 0 else -n
     R = rotation_to_z(up)
