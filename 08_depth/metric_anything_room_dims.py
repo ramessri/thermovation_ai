@@ -1,7 +1,8 @@
 """
-metric_anything_room_dims.py — heuristic room L x W x H from MetricAnything
-alone: no Zhang/marker camera calibration, no SfM, no scale.json, no other
-file from this project's pipeline. Single-image metric depth in, a room-size
+metric_anything_room_dims.py — heuristic room L x W x H from a single-image
+depth model alone (MetricAnything by default, DepthPro via --depth-model):
+no Zhang/marker camera calibration, no SfM, no scale.json, no other file
+from this project's pipeline. Single-image metric depth in, a room-size
 guess out, per video.
 
 This is deliberately a much cruder estimate than room_dims.py's SfM-based
@@ -27,10 +28,15 @@ is the MEDIAN across its sampled frames, with the full per-frame spread
 kept in the output JSON so a wide spread (a real, informative result, not
 noise to hide) is visible rather than silently averaged away.
 
-Usage (single video):
+Usage (single video, default model = metric_anything):
   python 08_depth/metric_anything_room_dims.py \
       --frames-dir "C:\\thermovation-output\\sfm 1\\IMG_3126\\frames" \
       --out 08_depth/results_metric_anything/IMG_3126
+
+Usage (DepthPro instead):
+  python 08_depth/metric_anything_room_dims.py --depth-model depthpro \
+      --frames-dir "C:\\thermovation-output\\sfm 1\\IMG_3126\\frames" \
+      --out 08_depth/results_depthpro/IMG_3126
 
 Usage (batch — every "<video>/frames" folder under a root):
   python 08_depth/metric_anything_room_dims.py \
@@ -87,7 +93,7 @@ def estimate_dims_single_frame(depth_cm: np.ndarray, fx: float, fy: float,
 
 
 def process_video(frames_dir: Path, out_dir: Path, model, predict_fn,
-                  device: str, n_frames: int, pixel_stride: int) -> dict:
+                  device: str, n_frames: int, pixel_stride: int, depth_model_name: str) -> dict:
     frames = sample_frames(frames_dir, n_frames)
     if not frames:
         return dict(error="no frames found")
@@ -99,7 +105,14 @@ def process_video(frames_dir: Path, out_dir: Path, model, predict_fn,
             continue
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
-        fx = fy = float(w)   # MetricAnything's own documented no-intrinsics fallback
+        # f_px=image_width is MetricAnything's own documented no-intrinsics
+        # fallback, and used here as the pinhole back-projection focal
+        # length regardless of which model produced the depth — DepthPro's
+        # own metric output doesn't consume focal_px the way MetricAnything's
+        # does (see predict_hf/predict_metric_anything in depth_models.py),
+        # but the back-projection step needs SOME assumed focal length
+        # either way, so the same fallback keeps both paths comparable.
+        fx = fy = float(w)
         cx, cy = w / 2.0, h / 2.0
         depth_cm = predict_fn(rgb, model, device, focal_px=fx)
         dims = estimate_dims_single_frame(depth_cm, fx, fy, cx, cy, pixel_stride)
@@ -119,20 +132,29 @@ def process_video(frames_dir: Path, out_dir: Path, model, predict_fn,
         return float(np.median(vals)) if vals else None
 
     result = dict(
-        method="metric_anything_native_heuristic",
+        method=f"{depth_model_name}_native_heuristic",
         assumptions="f_px=image_width (no calibration), level camera (no gravity solve)",
         n_frames_used=len(per_frame),
         height_cm=med("height_cm"), length_cm=med("length_cm"), width_cm=med("width_cm"),
         per_frame=per_frame,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "metric_anything_room_dims.json").write_text(json.dumps(result, indent=2))
+    # Named per depth model (not always "metric_anything_room_dims.json")
+    # so a depthpro run doesn't silently overwrite a metric_anything run in
+    # the same --out dir, or vice versa.
+    (out_dir / f"{depth_model_name}_room_dims.json").write_text(json.dumps(result, indent=2))
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Heuristic room L x W x H from MetricAnything alone (no calibration, no SfM)")
+    parser.add_argument("--depth-model", choices=["metric_anything", "depthpro"],
+                        default="metric_anything",
+                        help="Which single-image depth model drives the heuristic (default: "
+                             "metric_anything, matching this script's original scope). depthpro "
+                             "uses the same level-camera/no-calibration heuristics — only the "
+                             "depth source changes, not the back-projection assumptions.")
     parser.add_argument("--frames-dir", type=Path, help="Single video's frames folder")
     parser.add_argument("--frames-root", type=Path,
                         help="Batch mode: root containing <video>/frames subfolders")
@@ -149,8 +171,8 @@ def main():
 
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    load_fn_ctor, predict_fn = DEPTH_MODELS["metric_anything"]
-    print("Loading MetricAnything...")
+    load_fn_ctor, predict_fn = DEPTH_MODELS[args.depth_model]
+    print(f"Loading {args.depth_model}...")
     model = load_fn_ctor(device)
 
     if args.frames_dir:
@@ -165,7 +187,7 @@ def main():
     summary = []
     for frames_dir, out_dir in jobs:
         video_name = out_dir.name
-        existing_path = out_dir / "metric_anything_room_dims.json"
+        existing_path = out_dir / f"{args.depth_model}_room_dims.json"
         if args.frames_root and not args.force and existing_path.exists():
             result = json.loads(existing_path.read_text())
             result["video"] = video_name
@@ -176,7 +198,7 @@ def main():
             continue
         print(f"\n=== {video_name} ===", flush=True)
         result = process_video(frames_dir, out_dir, model, predict_fn, device,
-                               args.n_frames, args.pixel_stride)
+                               args.n_frames, args.pixel_stride, args.depth_model)
         result["video"] = video_name
         summary.append(result)
         if "error" in result:
