@@ -27,6 +27,162 @@ infrastructure, and recommends the optimal placement for the Thermovation indoor
 
 ---
 
+## Setup
+
+Validated on: Windows 11, Python 3.12.9, NVIDIA RTX 3080 10GB, driver 610.88, CUDA 13.2,
+torch 2.13.0+cu132, pycolmap 4.1.1. A GPU with less than ~6GB VRAM is a real risk, not
+just slower — the placement scripts load GDINO + SAM2 + DepthPro + a SegFormer wall
+segmenter simultaneously with no unloading between stages, and on a 4GB card that's more
+likely to CUDA-OOM partway through than to just run slowly (see "GPU memory" below).
+
+### 1. Clone and create the environment
+
+```powershell
+git clone <repo-url>
+cd thermovation_ai
+python -m venv venv
+venv\Scripts\activate
+```
+
+### 2. Install PyTorch with CUDA first, matching your installed CUDA toolkit
+
+Check your CUDA version before this step: `nvcc --version` or `nvidia-smi`. Install the
+matching torch build from https://pytorch.org/get-started/locally/ — e.g. for CUDA 12.x:
+
+```powershell
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+Verify before continuing — do not proceed to step 3 on a CPU-only torch by accident:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+### 3. Install the core Python dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+`requirements.txt` bundles two things: the **core pipeline** deps (torch, opencv,
+transformers, sam2, pycolmap, python-dotenv) needed for everything below, and deps only
+needed for the `3d_recons_alternatives/` reconstruction-method comparison (`gsplat`,
+`nerfstudio`, `depth-anything-3`) — those three, plus MASt3R and VGGT, are clone-based,
+not plain pip packages; see the comments inside `requirements.txt` and
+`3d_recons_alternatives/README.md` if you need that comparison. Skip them if you only
+want the core geometry/placement pipeline.
+
+`pycolmap` on PyPI ships with CUDA support built in on supported platforms — no separate
+COLMAP install needed. `run_sfm.py --gpu` uses it; without `--gpu` it falls back to CPU
+(much slower, and the "Environment" note in this project's results was gathered with GPU
+reconstruction — see stage table below for typical runtimes).
+
+### 4. Vendor MetricAnything (one of five depth models — not pip-installable)
+
+Only needed if you pass `--depth-model metric_anything` anywhere (DepthPro, the other
+supported option, needs nothing extra — it's plain `transformers`). Clone it into
+`08_depth/vendor/` — `depth_models.py`'s `load_metric_anything()` already points
+`sys.path` at the correct subdirectory inside it and works around a `torch.hub.load`
+relative-path quirk in the vendored code itself, so the clone is the only manual step:
+
+```powershell
+mkdir 08_depth\vendor
+git clone https://github.com/metric-anything/metric-anything.git 08_depth\vendor\metric-anything
+```
+
+This is a large clone and is intentionally **not** committed to this repo — re-run the
+clone on each machine that needs `metric_anything` rather than trying to ship it in git.
+
+### 5. HuggingFace models — auto-download on first run, no manual step
+
+Every detector/segmenter/depth model below downloads its own weights from the HF Hub the
+first time it's loaded (cached under `~/.cache/huggingface` after that):
+
+| Model | Used by | HF id |
+|---|---|---|
+| GroundingDINO (tiny) | pipe/fitting/electrical/window detection | `IDEA-Research/grounding-dino-tiny` |
+| SAM2.1 (hiera-small) | box → mask segmentation | `facebook/sam2.1-hiera-small` |
+| DepthPro | depth diagnostic + optional densification | `apple/DepthPro-hf` |
+| SegFormer-b2 (ADE20K) | wall-segmentation diagnostic | `nvidia/segformer-b2-finetuned-ade-512-512` |
+| MetricAnything | alternate depth model (needs step 4) | `yjh001/metricanything_student_depthmap` |
+
+You'll see `Warning: You are sending unauthenticated requests to the HF Hub` on every run
+without one — harmless, but rate-limited. Set a token if you're running this a lot:
+
+```powershell
+setx HF_TOKEN "hf_..."
+```
+
+### 6. Configure paths
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env` to point `DATASET_DIR` at your source videos and `OUTPUT_DIR` at where
+pipeline outputs should land (both are plain paths, no quoting needed even with spaces).
+
+### 7. Experimental-arm weight files (optional, not needed for placement)
+
+`yoloe-11s-seg.pt`, `yolov8s-worldv2.pt`, and `weights/clip/ViT-B-32.pt` are gitignored
+(`*.pt` / `*.ts`) and won't come through on a fresh clone. They're only used by the
+YOLO-World/YOLOE segmentation-benchmark arms in `experiments/` — `ultralytics`
+auto-downloads its own YOLO checkpoints on first use of those detectors. Not required for
+`06_placement/placement_3d.py` or `06_placement/single_image_placement.py`.
+
+### GPU memory
+
+The scripts below load 3-4 models into VRAM at once per video/photo and don't unload
+between stages. On the validated 10GB card this comfortably fits; on anything under
+~6GB, expect either a slow CPU fallback (PyTorch will not do this automatically — a
+genuine OOM will crash the run) or an out-of-memory crash partway through loading the
+third or fourth model. There's no flag to sequence model loading yet — if you hit this,
+say so and it can be added.
+
+---
+
+## Running
+
+### SfM way — full pipeline, one video (or a glob of many)
+
+```powershell
+python run.py "dataset\myvideo.mp4" --calibrate --gpu --align --placement
+```
+
+Stages run in order, each cached (add `--force` to redo): frame extraction → marker
+calibration → SfM reconstruction (pycolmap, `--gpu` for CUDA) → marker→metric scale →
+room dimensions → (with `--placement`) the 3D placement recommendation. Add `--pipes` to
+also run pipe-path extraction. `--parallel N` processes multiple videos concurrently.
+Output lands under `OUTPUT_DIR/<video-name>/` (frames, sfm, scale.json, room_dims.json,
+placement outputs).
+
+To re-run just the placement stage on an already-reconstructed video:
+
+```powershell
+python 06_placement\placement_3d.py "output\pipeline\myvideo\sfm" "output\pipeline\myvideo\frames" --model 0
+```
+
+`--model` is the sparse reconstruction's model index (usually `0`; check
+`sfm\sparse\` for alternatives if reconstruction fragmented into more than one model).
+Key flags: `--depth-model {none,depthpro,metric_anything}` (diagnostic depth map;
+`--no-densify-depth` keeps it diagnostic-only, the validated-safe default),
+`--min-wall-inliers` (evidence floor before a wall is trusted, default 2000),
+`--no-rucklauf` (skip Rücklauf localization, free-wall-space mode).
+
+### No-SfM way — one photo or raw video, no reconstruction
+
+```powershell
+python 06_placement\single_image_placement.py path\to\photo.jpg --depth-model depthpro --out results\
+```
+
+`--depth-model` is required (`depthpro` or `metric_anything`, no default — pick
+consciously). No camera calibration or verified metric scale is available this way (see
+"Placement" table entry above) — treat results as considerably less trustworthy than the
+SfM path; the batch results published from this project's own testing back that up.
+
+---
+
 ## Repository guide
 
 Scripts present in numbered folders, one per pipeline stage, so folder order == run order.
@@ -733,7 +889,7 @@ per-video breakdowns.
 ### Next (rough priority order)
 - [x] Pipe paths & lengths: SAM2/YOLOE pipe masks → skeletonization → back-projection onto 3D model (`07_pipes/pipe_paths.py`, see visualization-bug fix above)
 - [ ] Quantitative segmentation metrics (mIoU / precision / recall vs Boilers COCO GT)
-- [ ] NeRF / 3D Gaussian Splatting / MASt3R / VGGT comparison on IMG_3126 + 09.07.37 — environment fully set up (see above), no runs yet
+- [x] NeRF / 3D Gaussian Splatting / MASt3R / VGGT comparison — scope grew from the original 2-video plan to all 35 videos in `sfm 1` (24 with usable `scale.json`); no-admin-rights toolchain solved for both NeRF (torch implementation, no compiler needed) and 3DGS (portable MSVC download); full per-video L×W×H results for all 8 arms (SfM, DepthPro, ZoeDepth, MetricAnything, MASt3R, VGGT, 3DGS, NeRF) plus ground-truth error written to `3d_recons_alternatives/Measurements(SfM).csv`; headline finding: MetricAnything and VGGT beat classical SfM on accuracy; NeRF/3DGS results are from a deliberately tiny iteration budget (500/1500 steps) and need a full-budget re-run before being trusted as final numbers — see `3d_recons_alternatives/README.md` for the complete writeup
 - [ ] Robustness experiments: lighting / occlusion / reflective-surface analysis across resolution tiers
 - [ ] Ruler-verify the printed marker's true size (printer scaling risk, still outstanding)
 - [ ] End-to-end MVP: video in → scaled geometry + placement recommendation + report out
@@ -742,5 +898,6 @@ per-video breakdowns.
 
 ## Environment
 
-- Windows 11, Python: OpenCV, PyTorch, pycolmap (CUDA-enabled)
+Full setup and exact validated versions: see **Setup** near the top of this file. Short
+version — Windows 11, Python 3.12.9, PyTorch + CUDA, pycolmap (CUDA-enabled).
 - GPU: NVIDIA RTX 3080 10GB - dev PC (upgraded 2026-08-20 from GTX 1650 4GB)

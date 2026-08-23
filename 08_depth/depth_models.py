@@ -97,13 +97,29 @@ def predict_hf(image_rgb: np.ndarray, loaded, device: str, **_kwargs) -> np.ndar
 # ── MetricAnything (own package, own HF checkpoint) ─────────────────────────
 
 def load_metric_anything(device: str):
-    """Requires `git clone https://github.com/metric-anything/metric-anything`
-    on the Python path first — see 08_depth/README.md. Checkpoint:
-    yjh001/metricanything_student_depthmap."""
+    """Checkpoint: yjh001/metricanything_student_depthmap. The repo is
+    vendored at 08_depth/vendor/metric-anything/ (cloned from
+    github.com/metric-anything/metric-anything) — the actual importable
+    module lives at models/student_depthmap/depth_model.py inside it, not
+    the repo root, so that specific subdirectory goes on sys.path."""
+    import os
+    import sys
+    from pathlib import Path
+    vendor_dir = Path(__file__).resolve().parent / "vendor" / "metric-anything" / "models" / "student_depthmap"
+    if str(vendor_dir) not in sys.path:
+        sys.path.insert(0, str(vendor_dir))
     from depth_model import MetricAnythingDepthMap
-    model = MetricAnythingDepthMap.from_pretrained(
-        "yjh001/metricanything_student_depthmap", filename="student_depthmap.pt",
-    ).to(device).eval()
+    # vit_factory.py calls torch.hub.load("network", ...) — a relative path
+    # resolved from the process CWD, not from this file's location. Has to
+    # be the actual CWD during the one call that triggers it.
+    cwd = os.getcwd()
+    try:
+        os.chdir(vendor_dir)
+        model = MetricAnythingDepthMap.from_pretrained(
+            "yjh001/metricanything_student_depthmap", filename="student_depthmap.pt",
+        ).to(device).eval()
+    finally:
+        os.chdir(cwd)
     print("  MetricAnything (student_depthmap) loaded")
     return model
 
