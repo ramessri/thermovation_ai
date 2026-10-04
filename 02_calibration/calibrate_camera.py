@@ -36,6 +36,8 @@ MAX_ABS_K1 = 0.3
 MAX_ABS_K2 = 0.6
 MAX_PRINCIPAL_OFFSET_FRAC = 0.20   # cx/cy must be within 20% of true image center
 MIN_TILT_SPREAD_DEG = 12.0         # marker plane normal must vary this much across views
+MIN_DFOV_DEG = 65.0                # diagonal FOV floor — rejects focal lengths implying
+MAX_DFOV_DEG = 130.0               # 2×+ telephoto or fisheye (implausible for site-survey captures)
 
 
 def collect_views(frames_dir: Path):
@@ -47,14 +49,12 @@ def collect_views(frames_dir: Path):
             continue
         if image_size is None:
             image_size = (bgr.shape[1], bgr.shape[0])
-        px_per_cm, corners, H, _ = detect_marker(bgr)
+        px_per_cm, _, _, grid_pts_full, _ = detect_marker(bgr)
         if px_per_cm is None:
             continue
-        H_cm2px = np.linalg.inv(H)
-        pts = cv2.perspectiveTransform(GRID_CM.reshape(-1, 1, 2), H_cm2px).reshape(-1, 2)
         obj = np.hstack([GRID_CM, np.zeros((9, 1))]).astype(np.float32)
         obj_pts.append(obj)
-        img_pts.append(pts.astype(np.float32))
+        img_pts.append(grid_pts_full.astype(np.float32))
         names.append(f.name)
     return obj_pts, img_pts, image_size, names
 
@@ -101,6 +101,12 @@ def validate_calibration(result: dict, rvecs) -> str | None:
     spread = tilt_spread_deg(rvecs)
     if spread < MIN_TILT_SPREAD_DEG:
         return f"insufficient view-angle diversity (tilt spread {spread:.1f}deg < {MIN_TILT_SPREAD_DEG}deg)"
+    diag_px = np.hypot(w, h)
+    dfov_deg = 2 * np.degrees(np.arctan(diag_px / (2 * fx)))
+    if dfov_deg < MIN_DFOV_DEG or dfov_deg > MAX_DFOV_DEG:
+        return (f"implausible diagonal FOV {dfov_deg:.1f}° (focal={fx:.0f}px, diag={diag_px:.0f}px); "
+                f"expected {MIN_DFOV_DEG:.0f}–{MAX_DFOV_DEG:.0f}° for a site-survey phone camera — "
+                "optimizer likely traded focal length against distortion on limited view diversity")
     return None
 
 

@@ -89,7 +89,7 @@ def build_obstacle_mask(image_rgb: np.ndarray, device: str,
     for m in sam2_from_boxes(sam2_pred, image_rgb, boxes):
         mask |= (m.squeeze() > 0).astype(np.uint8)
 
-    yolo_model = load_yolo_world()
+    yolo_model = load_yolo_world(device)
     boxes, _, _ = detect_yolo_world(image_rgb, yolo_model, yolo_classes, threshold)
     for m in sam2_from_boxes(sam2_pred, image_rgb, boxes):
         mask |= (m.squeeze() > 0).astype(np.uint8)
@@ -199,7 +199,7 @@ def main():
     h, w = bgr.shape[:2]
 
     if args.auto_scale:
-        px_per_cm, marker_corners, _, debug_img = detect_marker(bgr, debug=True)
+        px_per_cm, marker_corners, _, _, debug_img = detect_marker(bgr, debug=True)
         if px_per_cm is None:
             raise RuntimeError(
                 "Fiducial marker not detected. Check lighting/focus or use manual scale."

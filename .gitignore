@@ -2,6 +2,13 @@
 Boilers.coco
 dataset
 output
+merged
+
+# Vendored (cloned on setup, not committed — see README Setup step 4)
+08_depth/vendor/
+
+# Local machine config
+.env
 
 # Local machine config
 .env
@@ -11,7 +18,11 @@ __pycache__
 *.pyc
 *.pt
 
+#ts
+*.ts
+
 # Docs (for LLM assisted coding)
 CLAUDE.md
 DATA_COLLECTION_PROTOCOL.md
 llm_context.md
+docs/

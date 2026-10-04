@@ -194,17 +194,25 @@ def _darkness_ok(gray: np.ndarray, cands: list[dict], idxs: list[int]) -> bool:
 def detect_marker(
     image_bgr: np.ndarray,
     debug: bool = False,
-) -> tuple[float | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[float | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """
     Detect the 3x3 fiducial marker in a BGR image.
 
     Returns
     -------
-    px_per_cm  : float — scale at the marker (None if not detected)
-    corners    : (4,2) float32 — centers of the 4 corner squares, TL/TR/BR/BL
-                 (grid order; may be 180°-flipped, irrelevant for scale)
-    H_img2cm   : (3,3) float64 — maps image pixels to cm on the board plane
-    debug_img  : annotated BGR image if debug=True, else None
+    px_per_cm     : float — scale at the marker (None if not detected)
+    corners       : (4,2) float32 — centers of the 4 corner squares, TL/TR/BR/BL
+                    (grid order; may be 180°-flipped, irrelevant for scale)
+    H_img2cm      : (3,3) float64 — maps image pixels to cm on the board plane.
+                    Useful for validating the detection, computing px/cm, and
+                    rejecting false positives — NOT as a source of calibration
+                    image coordinates (it's fit from grid_pts_full, so
+                    reprojecting through it just returns its own best-fit
+                    approximation instead of the real detected pixels).
+    grid_pts_full : (9,2) float32 — the actual detected square centers, in
+                    image pixels, row-major (TL first). Use this for
+                    calibration correspondences.
+    debug_img     : annotated BGR image if debug=True, else None
     """
     gray_full = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -219,7 +227,7 @@ def detect_marker(
     cands = _square_blobs(gray)
     fit = _fit_grid(cands)
     if fit is None or not _darkness_ok(gray, cands, fit["idxs"]):
-        return None, None, None, None
+        return None, None, None, None, None
 
     grid_pts_full = fit["grid_pts"] / scale          # back to full-res pixels
 
@@ -265,7 +273,7 @@ def detect_marker(
                     f"scale: {px_per_cm:.2f} px/cm  reproj_err: {fit['reproj_err'] / scale:.1f}px",
                     (16, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 240, 240), 2, cv2.LINE_AA)
 
-    return px_per_cm, corners, H_img2cm, debug_img
+    return px_per_cm, corners, H_img2cm, grid_pts_full, debug_img
 
 
 def _marker_region_sharpness(bgr: np.ndarray, corners: np.ndarray) -> float:
@@ -306,7 +314,7 @@ def best_marker_frame(
             break
         if idx % every_n == 0:
             checked += 1
-            px_per_cm, corners, H, _ = detect_marker(bgr)
+            px_per_cm, corners, H, _, _ = detect_marker(bgr)
             if px_per_cm is not None:
                 detected += 1
                 sharp = _marker_region_sharpness(bgr, corners)
@@ -342,7 +350,7 @@ def main():
         if frame is None:
             print("RESULT: marker NOT detected in any frame.")
             return
-        _, _, _, debug_img = detect_marker(frame, debug=True)
+        _, _, _, _, debug_img = detect_marker(frame, debug=True)
         print(f"px_per_cm : {px_per_cm:.3f}  ({10 / px_per_cm:.2f} mm/px)")
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -352,7 +360,7 @@ def main():
         bgr = cv2.imread(str(args.input))
         if bgr is None:
             raise FileNotFoundError(args.input)
-        px_per_cm, corners, H, debug_img = detect_marker(bgr, debug=True)
+        px_per_cm, corners, H, _, debug_img = detect_marker(bgr, debug=True)
         if px_per_cm is None:
             print("RESULT: marker NOT detected.")
             return
