@@ -27,6 +27,67 @@ infrastructure, and recommends the optimal placement for the Thermovation indoor
 
 ---
 
+## Project status at a glance
+
+### Methods tried
+
+| Method | Where | Status | Headline result |
+|---|---|---|---|
+| Marker-based scale detection (3×3 fiducial) | `02_calibration/detect_marker.py` | Working, all videos | 4.3–29.5 px/cm depending on video resolution and marker distance |
+| Marker-based camera calibration (Zhang) + plausibility gates | `02_calibration/calibrate_camera.py` | Working; gates added after two failure modes | Focal +5.9% / scale +7.7% vs self-calibration on IMG_3126; DFOV gate rejects a 58° false minimum |
+| Sparse SfM (COLMAP/pycolmap, CPU and CUDA) | `03_reconstruction/run_sfm.py` | Working, the production baseline | IMG_3126: 194/226 registered, 0.63 px reprojection error |
+| Marker→metric scale: triangulation | `04_scale/scale_sfm.py` | Working for 4K clips | 37.72 cm/unit, 1.4% spread (IMG_3126) |
+| Marker→metric scale: depth-ratio fallback | `04_scale/scale_sfm.py` | Working for 576p clips | Core CV ~1.2–1.5%, but unstable across reruns (see below) |
+| Room dimensions from sparse cloud (gap-based ceiling rule) | `05_geometry/room_dims.py` | Working; height is a lower bound when the ceiling is uncovered | Footprint within −10%/−8% of tape measure on the best video (09.07.37, 2026-08-02 run) |
+| Room-frame alignment (Sim3) | `05_alignment/` | Opt-in `--align` | Not evaluated numerically |
+| Placement recommendation (3D, wall + Rücklauf + keep-outs) | `06_placement/placement_3d.py` | Opt-in `--placement`; skips when no clean wall | First recommendation IMG_3126 (d = 101 cm to Rücklauf); 3 spots on each 576p clip |
+| Pipe paths & lengths (lifted masks → centerline) | `07_pipes/pipe_paths.py` | Implemented; one run on MicrosoftTeams; no ground truth | 9 pipes, longest 281 cm; no Rücklauf pair found |
+| Segmentation benchmark: GDINO / YOLO-World / YOLOE + SAM2 | `experiments/compare_arms.py`, `sweep_prompts.py` | Run; small sample (see caveat) | Best pipe mIoU is GDINO+SAM2 (0.936) |
+| NeRF / 3D Gaussian Splatting / MASt3R / VGGT | `3d_recons_alternatives/` | Scaffolded, not executed | No results |
+| Monocular metric depth (5 models) | `08_depth/` | Scaffolded, not executed | No results |
+
+### Current on-disk results (not yet validated against ground truth)
+
+These are the newest `room_dims.json` files in `output/pipeline/`. File dates are the
+write dates, not run dates; the run configuration is not recorded alongside the files.
+The 2026-08-04 and 2026-08-09 tables above are the last ones with documented configs.
+
+| Video (file date) | cm/unit | L × W (cm) | H (cm) | Ground truth (L × W × H) | L / W / H vs GT |
+|---|---|---|---|---|---|
+| IMG_3126 (08-11) | 37.65 | 425.1 × 216.6 | 146.0 (lower bound) | 525 × 152 × 235 | −19% / +43% / n.a. |
+| IMG_3128 (08-09) | 30.75 | 461.8 × 200.3 | 113.2 (lower bound) | not measured | n.a. |
+| MicrosoftTeams (08-14) | 22.42 | 263.9 × 175.3 | 151.9 (lower bound) | not measured | n.a. |
+| WhatsApp 17.41.45 (08-11) | 6.17 | 413.5 × 357.6 | 229.3 (lower bound) | 381 × 347 × 244 | +9% / +3% / −6% |
+| WhatsApp 09.07.37 (08-09) | 11.52 | 210.6 × 136.6 | 62.9 (lower bound) | 464 × 237 × 244 | −55% / −42% / n.a. |
+| BHarald Malluche Heizraum (08-10) | 26.07 | 462.3 × 460.0 | 157.6 (lower bound) | not measured | n.a. |
+
+**Two problems in this table need follow-up before any of it is quoted:**
+- **09.07.37 regressed.** The 2026-08-04 and 2026-08-09 runs gave 20 cm/unit and roughly
+  418 × 218 cm; the current file gives 11.5 cm/unit and 211 × 137 cm, which is worse than
+  any previous run on this video.
+- **17.41.45's scale** has moved between 6.2 and 28 cm/unit across same-day reruns.
+  The current 6.17 cm/unit is the lowest value recorded for this video.
+
+Also, the BHarald video (`dataset/BHarald Malluche Heizraum Video.mp4`, added 2026-08-10)
+has no entry in the earlier sections, no ground truth, and no recorded run config.
+
+### Open issues
+- Ground-truth measurements exist for three videos only. Nothing has been measured for
+  IMG_3128, MicrosoftTeams, or the BHarald video.
+- Height is still reported as a lower bound on every video, because no clip has the
+  deliberate ceiling sweep from the capture protocol.
+- Run-to-run variance is documented but not bounded. The reproducibility notes above are
+  the only evidence, and it is based on single-run comparisons.
+- Pipe-length numbers have no ground truth, and Rücklauf pairing failed on the one video
+  that was run.
+- The segmentation benchmark is small: 18 Boiler and 40 pipe ground-truth instances per arm.
+  Differences of a few points are not meaningful at this sample size.
+- The alternative reconstruction methods (3DGS, NeRF, MASt3R, VGGT) and depth models have
+  no outputs. Their README runbooks cite library flags checked against public docs, not
+  against runs.
+
+---
+
 ## Repository guide
 
 Scripts present in numbered folders, one per pipeline stage, so folder order == run order.
@@ -42,11 +103,19 @@ Scripts present in numbered folders, one per pipeline stage, so folder order == 
 | `04_scale/scale_sfm.py` | Marker to metric bridge: detects the marker in registered SfM frames, splits sightings into temporal segments (one per physical placement), triangulates the 9 square centers per segment, and solves the metric scale (cm per model unit) with per-segment cross-validation. If no segment triangulates reliably (marker too small/distant — see 576p results below), falls back to `depth_ratio_scale`: pinhole depth from the marker's own px/cm vs. the model-unit depth of well-triangulated SfM points in the marker footprint, ratioed across frames. |
 | `05_geometry/room_dims.py` | Room dimensions from the scaled sparse model: gravity from camera poses (refined on floor inliers), floor/ceiling density peaks → height (flagged as lower bound if the ceiling is uncovered), min-area rectangle over the **largest spatially-connected cluster** of the top-down projection (rejects disconnected outlier fragments that would otherwise blow up the footprint) → length × width. Both height and footprint carry an explicit `*_reliable` flag based on minimum point-support thresholds. Renders a floor-plan visualization. |
 | `06_placement/placement_3d.py` | **Fully automatic 3D placement recommendation** (opt-in via `run.py --placement`): wall plane from the triangulated marker when available; otherwise a RANSAC vertical-wall search restricted to points near the (auto-located) Rücklauf, which stays reliable even when the marker was seen on multiple surfaces. Obstacles + window/recess keep-outs from the point cloud (density-filtered, camera-side; recess keep-out only applies on the triangulated-marker path, not the RANSAC one), Rücklauf auto-located via the blue-marking convention (small blue circular cap with non-blue surroundings, lifted to 3D through co-visible features), candidates scored in cm (Rücklauf distance + clearance + mounting height). A tilt guard rejects unreliable wall planes (>25° from vertical, e.g. marker seen on multiple surfaces). Renders the recommendation into a real frame. |
+| `07_pipes/pipe_paths.py` | Pipe path & length extraction: lifts 2D pipe masks into the 3D point cloud (reusing `placement_3d.py`'s co-visibility mechanism), orders the lifted points into a centerline, and reports polyline length in cm. Classifies each pipe as blue / red / neither by hue and attempts a Rücklauf pairing. Output: `pipe_lengths.json`. Opt-in via `run.py --pipes`. |
 | `experiments/experiment_pipeline.py` | Three-mode segmentation benchmark on the Boilers COCO dataset: GroundingDINO→SAM2, YOLO-World→SAM2, GT-boxes→SAM2 (manual proxy). |
+| `experiments/compare_arms.py` | Quantitative segmentation benchmark (precision/recall/mIoU per class) across GDINO+SAM2, YOLO-World+SAM2, and YOLOE, vs. the Boilers COCO ground truth. Output: `output/experiment/compare_arms.json`. |
+| `experiments/sweep_prompts.py` | Precision/recall vs. confidence-threshold sweep per detector arm. Output: `output/experiment/sweep_prompts.json`. |
+| `experiments/auto_label_pipes.py` | GDINO+SAM2 auto-generates `pipe` mask proposals on the Boilers dataset. |
+| `experiments/upload_to_roboflow.py` | Uploads those proposals to Roboflow as predictions awaiting human review, which are then merged into the Boilers COCO ground truth (`merged/`). |
 | `experiments/run_video_test.py` | Qualitative GDINO + YOLO-World detection on raw video frames. |
 | `experiments/placement_mvp.py` | 2D placement MVP on a single frame: scores candidate unit positions by distance-to-Rücklauf + obstacle clearance. Supports `--auto-scale` (marker-based, no clicks) or manual 2-point scale calibration. |
 | `experiments/visualize_sfm.py` | Presentation visuals of the scaled reconstruction: colored metric `.ply` export (open in CloudCompare/MeshLab for interactive orbits) + rendered dark-theme PNG views (full scene + room detail) with camera trajectory and marker position. Output: `<sfm_dir>/viz/`. |
-| `dataset/` | 5 boiler-room videos (2× iPhone **1920×1080** `.mov` — corrected 2026-08-02; 3× 576p phone originals) + extracted frames. |
+| `3d_recons_alternatives/` | **Scaffolded, not yet executed.** Benchmarking harness for alternative reconstruction methods vs. the SfM baseline: 3D Gaussian Splatting (`gsplat`), NeRF (`nerfstudio`'s `nerfacto`), MASt3R (feed-forward, no SfM/marker input, tests its own metric-scale checkpoint), and VGGT (feed-forward, single pass, scale ratio-calibrated against the marker-scaled SfM trajectory). `compare_reconstructions.py` compares any subset's `room_dims` output side by side. See `3d_recons_alternatives/README.md` for the runbook. |
+| `08_depth/` | **Scaffolded, not yet executed.** Monocular metric depth models (DepthAnythingV2-Metric, ZoeDepth, DepthPro, MetricAnything, DA3Metric) — tests (1) whether dense per-pixel depth recovers ceilings that sparse SfM structurally can't (see ceiling bug below), and (2) whether a depth model's metric prediction can replace the marker as the scale source (`scale_sfm.py --scale-method monocular_depth`). See `08_depth/README.md`. |
+| `dataset/` | 6 boiler-room videos: 2× iPhone **1920×1080** `.mov` (corrected 2026-08-02), 3× 576p phone originals, and `BHarald Malluche Heizraum Video.mp4` (added 2026-08-10). Plus extracted frames. |
+| `merged/` | Roboflow-exported dataset merging reviewed pipe mask proposals into the Boilers COCO ground truth used by `compare_arms.py` / `sweep_prompts.py`. |
 | `output/` | Generated artifacts: marker detections (`marker_v2/`), SfM models (`sfm/`), placement visualizations. Both dataset and output will be shared in Sharepoint, contact Sri Ramesh or Quirin Hanzlmeier for access|
 
 
@@ -448,6 +517,37 @@ self-calibration — the same path that produced −10%/−8% footprint errors b
 correspondence fix. Rerun with `python run.py dataset/*.mov --calibrate --gpu --force`
 to validate.
 
+### Segmentation benchmark — GDINO+SAM2 vs YOLO-World+SAM2 vs YOLOE (2026-08-11 to 2026-08-14)
+
+Quantitative precision/recall/mIoU vs. the Boilers COCO ground truth, via `experiments/compare_arms.py`. Each arm uses the single threshold listed; sample sizes are 18 Boiler and 40 pipe ground-truth instances per arm:
+
+| Arm | Class | Precision | Recall | mIoU |
+|---|---|---|---|---|
+| GDINO+SAM2 (thresh 0.25) | Boiler | 0.271 | 0.722 | 0.888 |
+| GDINO+SAM2 | pipe | 0.600 | 0.675 | 0.936 |
+| YOLO-World+SAM2 (thresh 0.01) | Boiler | 0.226 | 0.389 | 0.890 |
+| YOLO-World+SAM2 | pipe | 0.455 | 0.125 | 0.849 |
+| YOLOE (thresh 0.05) | Boiler | 0.229 | 0.611 | 0.880 |
+| YOLOE | pipe | 0.231 | 0.075 | 0.712 |
+
+GDINO+SAM2 currently leads on pipe precision/recall; all three arms have low Boiler
+precision (many false positives). `sweep_prompts.json` sweeps only YOLO-World's threshold
+(with the `pipe` prompt): Boiler recall drops from 0.50 at 0.01 to 0.28 at 0.05 and 0.06
+at 0.25, while Boiler precision rises from 0.39 to 0.83 at 0.05. That is a real
+precision/recall trade-off, but at 0.05 pipe recall falls to 0.05, so no single YOLO-World
+threshold is strong on both classes.
+Output: `output/experiment/compare_arms.json`, `output/experiment/sweep_prompts.json`.
+
+### 3D reconstruction alternatives — scaffolding added, not yet run (2026-08-14)
+
+`3d_recons_alternatives/` (3DGS, NeRF, MASt3R, VGGT) and `08_depth/` (5 monocular metric
+depth models) were added as standalone, offline scripts — per the compute decision, heavy
+models run on the university RTX 3080 rather than getting wired into `run.py`. Both ship
+with detailed runbook READMEs but **no results yet**: no `*_room_dims.json` or
+`comparison.json` output exists anywhere in the repo. Classical COLMAP/pycolmap SfM
+remains the only reconstruction method with end-to-end, ground-truth-checked numbers
+(above). Verified against each library's public docs/source, not by actually running them.
+
 ### Known limitations
 - Marker orientation is ambiguous (180° flip) — irrelevant for scale; matters only if the
   marker is later used as a pose/orientation anchor.
@@ -489,15 +589,19 @@ to validate.
 - [x] Third full pipeline rerun, all 5 videos (2026-08-04, post-glob-fix) — see Results; a starker reproducibility data point (WhatsApp 17.41.45's scale moved >3x between same-day runs)
 - [x] Fixed a circular-reprojection bug in calibration/triangulation correspondences: `detect_marker()` now exposes the actual detected `grid_pts_full` instead of `calibrate_camera.py`/`scale_sfm.py` reconstructing points via the homography fit from those same points; full 5-video rerun confirms the effect (RMS roughly doubled on the videos already calibrating — now measuring real detector noise instead of the homography's self-fit; WhatsApp 09.07.37 calibration now passes the plausibility gate where it was previously rejected)
 - [x] **DFOV plausibility gate** added to `calibrate_camera.py` — the 2026-08-09 correspondence fix caused a new failure mode where the optimizer found a wrong local minimum (focal=1052px, DFOV=58°) that passed all prior gates (k1/k2, principal-point, tilt-spread) but produced a 2.5× wrong depth-ratio scale on WhatsApp 09.07.37 (9.90→~20 cm/u expected). New gate rejects `DFOV < 65° or > 130°`; confirmed: 3 good videos at 97–102° pass, the bad one at 58° is rejected → self-cal fallback restores −10%/−8% footprint accuracy. Rerun with `--force` to take effect.
+- [x] YOLOE evaluation: single-model open-vocab detection+segmentation as 4th benchmark arm vs GDINO+SAM2 / YOLO-World+SAM2 — see Results; GDINO+SAM2 currently leads on pipe precision/recall, all arms weak on Boiler precision
+- [x] Quantitative segmentation metrics (mIoU / precision / recall vs Boilers COCO GT) — see Results (`compare_arms.py`, `sweep_prompts.py`)
+- [x] Pipe paths & lengths stage implemented (`07_pipes/pipe_paths.py`, opt-in via `run.py --pipes`); first output on MicrosoftTeams (9 pipes, no Rücklauf pair). Not validated against ground truth — see Project status
+- [ ] Validate pipe lengths against tape measurements and make Rücklauf pairing succeed on at least one video
+- [x] Roboflow-merged pipe mask dataset (`merged/`) feeding the Boilers COCO ground truth
+- [x] Scaffolding for NeRF / 3D Gaussian Splatting / MASt3R / VGGT added as standalone offline scripts (`3d_recons_alternatives/`) plus monocular depth models (`08_depth/`) — not yet executed, see Results
 
 ### In progress
-- [ ] YOLOE evaluation: single-model open-vocab detection+segmentation (text/visual/prompt-free) as 4th benchmark arm vs GDINO+SAM2 / YOLO-World+SAM2 / manual+SAM2 — smoke test running
 - [ ]  Test whether real capture technique fixes the height-recovery failure
 
 ### Next (rough priority order)
-- [ ] Pipe paths & lengths: SAM2/YOLOE pipe masks → skeletonization → back-projection onto 3D model
-- [ ] Quantitative segmentation metrics (mIoU / precision / recall vs Boilers COCO GT)
-- [ ] NeRF / 3D Gaussian Splatting on the same scenes; compare vs SfM (accuracy, runtime, robustness) — GPU is now available for this
+- [ ] Actually run NeRF / 3DGS / MASt3R / VGGT on the dataset and compare vs SfM (accuracy, runtime, robustness) via `compare_reconstructions.py`
+- [ ] Run the monocular depth models (`08_depth/`) — ceiling-recovery check and scale-alternative check
 - [ ] Robustness experiments: lighting / occlusion / reflective-surface analysis across resolution tiers
 - [ ] Ruler-verify the printed marker's true size (printer scaling risk, still outstanding)
 - [ ] End-to-end MVP: video in → scaled geometry + placement recommendation + report out
@@ -508,3 +612,5 @@ to validate.
 
 - Windows 11, Python: OpenCV, PyTorch, pycolmap (CUDA-enabled)
 - GPU: NVIDIA GTX 1650 4GB - dev PC
+- Config: copy `.env.example` to `.env` to override `DATASET_DIR` / `OUTPUT_DIR`
+  (both optional — defaults match what `run.py` already used before `.env` existed).
