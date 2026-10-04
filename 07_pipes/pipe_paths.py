@@ -53,6 +53,25 @@ def fuse_masks_to_point_ids(rec: pycolmap.Reconstruction,
     return ids
 
 
+def fuse_masks_to_point_ids_with_provenance(
+        rec: pycolmap.Reconstruction,
+        frame_masks: dict[str, np.ndarray]) -> dict[int, set]:
+    """Like fuse_masks_to_point_ids, but also records which frame(s) actually
+    put each point inside a mask — needed so the visualization only ever
+    draws a cluster on a frame that really observed it (a point pulled in
+    from a frame across the room can otherwise reproject in-bounds on an
+    unrelated photo with no occlusion check, drawing garbage)."""
+    name_to_img = {im.name: im for im in rec.images.values()}
+    provenance: dict[int, set] = {}
+    for name, mask in frame_masks.items():
+        img = name_to_img.get(name)
+        if img is None:
+            continue
+        for pid in lift_mask_to_3d(rec, img, mask):
+            provenance.setdefault(pid, set()).add(name)
+    return provenance
+
+
 def points_xyz_and_color(rec: pycolmap.Reconstruction,
                          point_ids: set[int]) -> tuple[np.ndarray, np.ndarray]:
     """(xyz Nx3 float64, rgb Nx3 uint8) for the given point3D ids."""
@@ -256,6 +275,9 @@ def main():
     parser.add_argument("--model", default="1")
     parser.add_argument("--detector", choices=["gdino", "yoloworld", "yoloe"], default="gdino",
                         help="Placeholder default until Foundation's compare_arms picks a winner")
+    parser.add_argument("--pipe-prompt", default="pipe",
+                        help="Prompt/class phrase used for the pipe detector (see "
+                             "sweep_prompts.py for per-arm phrasing that scores best)")
     parser.add_argument("--voxel-cm", type=float, default=8.0)
     parser.add_argument("--min-cluster-points", type=int, default=15)
     parser.add_argument("--n-bins", type=int, default=12)
@@ -280,7 +302,7 @@ def main():
         if bgr is None:
             continue
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        pipe_masks = get_masks_for_prompt(args.detector, "pipe", rgb, models, args.threshold, device)
+        pipe_masks = get_masks_for_prompt(args.detector, args.pipe_prompt, rgb, models, args.threshold, device)
         if pipe_masks:
             combined = np.clip(sum(m.squeeze().astype(np.uint8) for m in pipe_masks), 0, 1)
             pipe_frame_masks[img.name] = combined
@@ -290,9 +312,10 @@ def main():
     print(f"Pipe masks found in {len(pipe_frame_masks)}/{rec.num_reg_images()} frames; "
           f"boiler masks in {len(boiler_frame_masks)} frames")
 
-    # fuse to 3D
-    pipe_ids = fuse_masks_to_point_ids(rec, pipe_frame_masks)
-    xyz, rgb_colors = points_xyz_and_color(rec, pipe_ids)
+    # fuse to 3D, keeping track of which frame(s) actually observed each point
+    pipe_provenance = fuse_masks_to_point_ids_with_provenance(rec, pipe_frame_masks)
+    pipe_ids_list = list(pipe_provenance.keys())
+    xyz, rgb_colors = points_xyz_and_color(rec, pipe_ids_list)
     print(f"Fused pipe cloud: {len(xyz)} points")
 
     boiler_xyz = None
@@ -308,6 +331,7 @@ def main():
 
     pipes_out = []
     pairing_clusters = []
+    cluster_frames: dict[int, set] = {}
     for cid, idxs in enumerate(cluster_idx_lists):
         cpts = xyz[idxs]
         ccolors = rgb_colors[idxs]
@@ -319,6 +343,8 @@ def main():
                               n_points=int(len(cpts)), confidence=confidence, color=color))
         pairing_clusters.append(dict(id=cid, centroid=cpts.mean(axis=0),
                                      axis=dominant_axis(cpts), color=color))
+        cluster_frames[cid] = set().union(
+            *(pipe_provenance[pipe_ids_list[i]] for i in idxs))
         print(f"  pipe {cid}: {length_cm:.1f}cm, {len(cpts)} points, color={color}, {confidence}")
 
     pair = find_best_rucklauf_pair(pairing_clusters, boiler_xyz, cm_per_unit)
@@ -335,32 +361,65 @@ def main():
     out_path.write_text(json.dumps(out, indent=2))
     print(f"Saved {out_path}")
 
-    # visualization: overlay centerlines on the first registered frame that
-    # has 2D pipe detections
+    # visualization: overlay centerlines on whichever registered frame actually
+    # observed the most clusters — restricted to, for each cluster, only the
+    # frames whose own 2D pipe mask actually contributed one of that cluster's
+    # points (cluster_frames). A candidate view is only allowed to draw a
+    # cluster it genuinely saw; there's no mesh/depth buffer here, so without
+    # this a point pulled in from a completely different wall can still
+    # mathematically reproject in-bounds on an unrelated photo (no occlusion
+    # check possible against a sparse cloud) and get drawn as if it belonged.
     if pipe_frame_masks:
-        view_name = next(iter(pipe_frame_masks))
-        view_img = next(im for im in rec.images.values() if im.name == view_name)
-        cam = rec.cameras[view_img.camera_id]
-        P = np.asarray(view_img.cam_from_world().matrix())
-        bgr = cv2.imread(str(args.frames_dir / view_name))
+        centerlines = {cid: cluster_centerline(xyz[idxs], args.n_bins)
+                       for cid, idxs in enumerate(cluster_idx_lists)}
 
-        def project(X_model: np.ndarray):
-            Xc = P @ np.append(X_model, 1.0)
-            if Xc[2] <= 0:
-                return None
-            xy = np.asarray(cam.img_from_cam(Xc[None, :3] / Xc[2]))
-            return tuple(np.round(xy.ravel()[:2]).astype(int))
+        def make_project(view_img):
+            cam = rec.cameras[view_img.camera_id]
+            P = np.asarray(view_img.cam_from_world().matrix())
+            w, h = cam.width, cam.height
 
-        colors_bgr = {"blue": (255, 100, 0), "red": (0, 0, 255), "neither": (0, 220, 0)}
-        for cid, idxs in enumerate(cluster_idx_lists):
-            centerline = cluster_centerline(xyz[idxs], args.n_bins)
-            color = pipes_out[cid]["color"]
-            pts2d = [p for p in (project(x) for x in centerline) if p is not None]
-            if len(pts2d) >= 2:
-                cv2.polylines(bgr, [np.array(pts2d)], False, colors_bgr[color], 3)
-        out_img = args.sfm_dir / "pipe_paths.jpg"
-        cv2.imwrite(str(out_img), bgr)
-        print(f"Saved {out_img}")
+            def project(X_model: np.ndarray):
+                Xc = P @ np.append(X_model, 1.0)
+                if Xc[2] <= 0:
+                    return None
+                xy = np.asarray(cam.img_from_cam(Xc[None, :3] / Xc[2])).ravel()[:2]
+                if not (0 <= xy[0] < w and 0 <= xy[1] < h):
+                    return None
+                return tuple(np.round(xy).astype(int))
+            return project
+
+        best_name, best_project, best_score, best_cids = None, None, -1, []
+        for view_name in pipe_frame_masks:
+            view_img = next(im for im in rec.images.values() if im.name == view_name)
+            project = make_project(view_img)
+            drawable_cids = []
+            for cid, cl in centerlines.items():
+                if view_name not in cluster_frames[cid]:
+                    continue
+                if sum(1 for p in (project(x) for x in cl) if p is not None) >= 2:
+                    drawable_cids.append(cid)
+            if len(drawable_cids) > best_score:
+                best_name, best_project, best_score, best_cids = (
+                    view_name, project, len(drawable_cids), drawable_cids)
+
+        if best_name is None:
+            print("No frame both observed a cluster and reprojects it in-bounds "
+                  "— skipping pipe_paths.jpg (nothing safe to draw)")
+        else:
+            view_name, project = best_name, best_project
+            print(f"Visualization frame: {view_name} ({best_score}/{len(centerlines)} "
+                  f"clusters actually observed here, in-bounds)")
+            bgr = cv2.imread(str(args.frames_dir / view_name))
+
+            colors_bgr = {"blue": (255, 100, 0), "red": (0, 0, 255), "neither": (0, 220, 0)}
+            for cid in best_cids:
+                color = pipes_out[cid]["color"]
+                pts2d = [p for p in (project(x) for x in centerlines[cid]) if p is not None]
+                if len(pts2d) >= 2:
+                    cv2.polylines(bgr, [np.array(pts2d)], False, colors_bgr[color], 3)
+            out_img = args.sfm_dir / "pipe_paths.jpg"
+            cv2.imwrite(str(out_img), bgr)
+            print(f"Saved {out_img}")
 
 
 if __name__ == "__main__":

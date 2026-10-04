@@ -4,6 +4,9 @@ dataset
 output
 merged
 
+# Vendored (cloned on setup, not committed — see README Setup step 4)
+08_depth/vendor/
+
 # Local machine config
 .env
 
