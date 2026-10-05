@@ -630,6 +630,16 @@ def main():
                              "excluded, failing the trust floor outright) even with no densify "
                              "involved. The segmentation itself still runs and saves either way.")
     parser.add_argument("--wall-seg-model", default="nvidia/segformer-b2-finetuned-ade-512-512")
+    parser.add_argument("--dense-ply", type=Path, default=None,
+                        help="Feed dense_pts_model (wall-surface evidence only — see the "
+                             "comment above its monocular-depth backprojection block) from a "
+                             "real dense MVS cloud (e.g. <sfm_dir>/dense/fused.ply from "
+                             "03_reconstruction/run_mvs.py --dense) instead of single-frame "
+                             "monocular depth. Multi-view stereo from every registered frame is "
+                             "denser and more accurate than one frame's depth-model guess, and "
+                             "this also skips loading the depth model entirely. When set, "
+                             "--depth-model's densification step is skipped (GDINO+SAM2 obstacle "
+                             "detection and the depth_map.png diagnostic still run normally).")
     args = parser.parse_args()
 
     scale_info = json.loads((args.sfm_dir / "scale.json").read_text())
@@ -693,6 +703,12 @@ def main():
     # candidate directly on an electrical panel because "closer is better"
     # scoring alone doesn't stop at the edge. ────────────────────────────
     pipe_xyz = fit_xyz = elec_xyz = window_xyz = dense_pts_model = wall_seg_xyz = np.empty((0, 3))
+    if args.dense_ply and args.dense_ply.exists():
+        import open3d as o3d
+        dense_pcd = o3d.io.read_point_cloud(str(args.dense_ply))
+        dense_pts_model = np.asarray(dense_pcd.points)   # same world frame as rec.points3D — see --dense-ply help
+        print(f"Dense MVS wall-surface evidence ({args.dense_ply.name}): {len(dense_pts_model)} points "
+             f"(skipping monocular depth densification)")
     det_frame_name = None
     if not args.no_gdino:
         det_frame_name = ruck_frame or max(
@@ -750,7 +766,7 @@ def main():
                 save_depth_viz(depth_cm, args.sfm_dir / "depth_map.png")
                 print(f"Saved {args.sfm_dir / 'depth_map.png'} ({args.depth_model})")
 
-                if not args.no_densify_depth:
+                if not args.no_densify_depth and len(dense_pts_model) == 0:
                     cam_det = rec.cameras[det_img.camera_id]
                     P_det = np.asarray(det_img.cam_from_world().matrix())
                     R_det, t_det = P_det[:, :3], P_det[:, 3]

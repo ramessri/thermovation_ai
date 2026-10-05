@@ -25,4 +25,6 @@ __pycache__
 CLAUDE.md
 DATA_COLLECTION_PROTOCOL.md
 llm_context.md
+context.txt
+context_3drecon_methods.txt
 docs/
