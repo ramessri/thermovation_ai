@@ -297,6 +297,14 @@ def main():
                              "whether the scale source or the geometry is doing the work. Output "
                              "then goes to room_dims_<scale-file-stem>.json instead of "
                              "room_dims.json, so it never overwrites the marker-based result.")
+    parser.add_argument("--dense-ply", type=Path, default=None,
+                        help="Use a dense point cloud (e.g. <sfm_dir>/dense/fused.ply from "
+                             "03_reconstruction/run_mvs.py --dense) instead of the sparse SfM "
+                             "points for footprint/height estimation. Dense MVS points share the "
+                             "sparse model's world coordinate frame (same undistorted workspace), "
+                             "so no extra alignment is needed — just far more points on "
+                             "textureless walls/floors than SIFT-matchable sparse features give. "
+                             "Camera poses (for gravity prior) still come from the sparse model.")
     args = parser.parse_args()
 
     scale_path = args.scale_json or (args.sfm_dir / "scale.json")
@@ -306,8 +314,14 @@ def main():
     print(f"Model: {rec.num_reg_images()} images, {rec.num_points3D()} points")
     print(f"Scale: {cm_per_unit:.4f} cm/unit (from {scale_path.name}, method={scale_info.get('method')})")
 
-    pts = load_filtered_points(rec) * cm_per_unit
-    print(f"Filtered points: {len(pts)}")
+    if args.dense_ply and args.dense_ply.exists():
+        import open3d as o3d
+        dense_pcd = o3d.io.read_point_cloud(str(args.dense_ply))
+        pts = np.asarray(dense_pcd.points) * cm_per_unit
+        print(f"Dense points ({args.dense_ply.name}): {len(pts)}")
+    else:
+        pts = load_filtered_points(rec) * cm_per_unit
+        print(f"Filtered (sparse) points: {len(pts)}")
 
     # align gravity to +Z (prior from cameras, refined on floor inliers)
     R, z_floor = gravity_rotation(rec, pts)

@@ -37,6 +37,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Progress/status lines below print real German/accented text ("Rücklauf",
+# °, ×) — Windows consoles and pipes default to a legacy codepage (cp1252)
+# that can't encode them, crashing the whole run on the first such
+# character. Force UTF-8, same fix as the sibling photogram project's
+# scripts/smoke.py. Also set PYTHONIOENCODING so every stage subprocess
+# this script spawns (run_sfm.py, placement_3d.py, etc.) inherits it too —
+# their own stdout needs the same fix, not just this top-level process's.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 PY = sys.executable
 ROOT = Path(__file__).parent
 DEFAULT_DATASET_DIR = Path(os.environ.get("DATASET_DIR", "dataset"))
@@ -69,14 +81,56 @@ def best_sparse_model(sfm_dir: Path) -> Path | None:
 
 def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
                   force: bool, calibrate: bool, gpu: bool, align: bool,
-                  pipes: bool, placement: bool) -> dict:
+                  pipes: bool, placement: bool, dense: bool = False,
+                  fix_jumps: bool = False, marker_type: str = "custom",
+                  export: bool = False, coverage: bool = False) -> dict:
     stem = video.stem.replace(" ", "_")
     work = out_root / stem
+    status = dict(video=video.name, work_dir=str(work))
+    try:
+        return _process_video_inner(
+            video, out_root, fps, max_dim, force, calibrate, gpu, align,
+            pipes, placement, dense, fix_jumps, marker_type, export, coverage, stem, work, status,
+        )
+    except RuntimeError as e:
+        # A required stage (frames/SfM) raised via sh() — previously this
+        # propagated all the way out of run.py with no report.json ever
+        # written, so a caller reading report.json from disk (the FastAPI
+        # wrapper) saw a clean process exit with nothing to read and had to
+        # guess. Always leave a report behind, and print an explicit
+        # "FAILED: ..." line the wrapper's log-tail fallback can also catch.
+        status["error"] = str(e)
+        status["runtime_s"] = round(time.perf_counter() - status.get("_t_start", time.perf_counter()), 1)
+        status.pop("_t_start", None)
+        print(f"FAILED: {e}")
+        report = work / "report.json"
+        work.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(status, indent=2))
+        status["report"] = str(report)
+        return status
+
+
+def _process_video_inner(video: Path, out_root: Path, fps: float, max_dim: int,
+                         force: bool, calibrate: bool, gpu: bool, align: bool,
+                         pipes: bool, placement: bool, dense: bool, fix_jumps: bool,
+                         marker_type: str, export: bool, coverage: bool,
+                         stem: str, work: Path, status: dict) -> dict:
     frames_dir = work / "frames"
     sfm_dir = work / "sfm"
     calib_path = work / "calib.json"
     t_start = time.perf_counter()
-    status = dict(video=video.name, work_dir=str(work))
+    status["_t_start"] = t_start
+
+    def fail(msg: str) -> dict:
+        status["error"] = msg
+        status["runtime_s"] = round(time.perf_counter() - t_start, 1)
+        status.pop("_t_start", None)
+        print(f"FAILED: {msg}")
+        report = work / "report.json"
+        work.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(status, indent=2))
+        status["report"] = str(report)
+        return status
 
     # 1. frame extraction
     if force or not any(frames_dir.glob("*.jpg")):
@@ -85,9 +139,14 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
     n_frames = len(list(frames_dir.glob("*.jpg")))
     status["frames"] = n_frames
 
-    # 2. camera calibration from marker sightings
-    if calibrate:
+    # 2. camera calibration from marker sightings (custom-board only — Zhang's
+    # method needs the board's known multi-square geometry across many views;
+    # ArUco markers are typically smaller/scattered and aren't a good target
+    # for this specific calibration approach, so ArUco mode self-calibrates
+    # via bundle adjustment instead, same as photogram does by default)
+    if calibrate and marker_type == "custom":
         if force or not calib_path.exists():
+            print(f"[{stem}:calibrate]")
             res = subprocess.run(
                 [str(c) for c in [PY, "02_calibration/calibrate_camera.py", frames_dir,
                                   "--output", calib_path]],
@@ -99,6 +158,9 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
             status["calibration"] = json.loads(calib_path.read_text())
         else:
             status["calibration_skipped"] = True
+    elif calibrate and marker_type == "aruco":
+        status["calibration_skipped"] = True
+        status["calibration_skip_reason"] = "marker_type=aruco self-calibrates (no Zhang target)"
 
     # 3. SfM
     if force or not (sfm_dir / "sparse").exists():
@@ -110,30 +172,101 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
         sh(cmd, f"{stem}:sfm")
     model_dir = best_sparse_model(sfm_dir)
     if model_dir is None:
-        status["error"] = "SfM produced no reconstruction"
-        return status
+        return fail("SfM produced no reconstruction")
     status["sparse_model"] = model_dir.name
 
+    # 3b. dense reconstruction (opt-in via --dense; best-effort — CUDA-only,
+    # see 03_reconstruction/run_mvs.py; failure never blocks the rest of the
+    # pipeline since scale/room_dims/placement all still work off the sparse model)
+    dense_ply = None
+    if dense:
+        dense_ply = sfm_dir / "dense" / "fused.ply"
+        if force or not dense_ply.exists():
+            print(f"[{stem}:dense]")
+            res = subprocess.run(
+                [str(c) for c in [PY, "03_reconstruction/run_mvs.py", sfm_dir, frames_dir,
+                                  "--model", model_dir.name]],
+                cwd=ROOT,
+            )
+            if res.returncode != 0:
+                print(f"[{stem}:dense] errored (non-fatal, sparse-only downstream)")
+        if dense_ply.exists():
+            status["dense_cloud"] = str(dense_ply)
+        else:
+            status["dense_skipped"] = True
+
+    # 3c. trajectory-jump detection + correction (opt-in via --fix-jumps;
+    # best-effort — a mis-registered "teleport" block from a tracking break
+    # can throw off both marker scale (if the marker was seen in an affected
+    # frame) and room_dims/placement geometry. Writes a corrected sparse
+    # model and, if present, a corrected dense cloud; downstream stages then
+    # use the corrected model transparently via model_dir.
+    if fix_jumps:
+        fixed_model_dir = sfm_dir / "sparse" / f"{model_dir.name}_fixed"
+        jumps_json = sfm_dir / "trajectory_jumps.json"
+        if force or not jumps_json.exists():
+            print(f"[{stem}:fix_jumps]")
+            res = subprocess.run(
+                [str(c) for c in [PY, "03_reconstruction/fix_trajectory_jumps.py", sfm_dir, frames_dir,
+                                  "--model", model_dir.name]],
+                cwd=ROOT,
+            )
+            if res.returncode != 0:
+                print(f"[{stem}:fix_jumps] errored (non-fatal, using uncorrected model)")
+        if jumps_json.exists():
+            status["trajectory_jumps"] = json.loads(jumps_json.read_text())
+            if fixed_model_dir.exists():
+                model_dir = fixed_model_dir
+                status["sparse_model"] = model_dir.name
+                status["trajectory_jumps_corrected"] = True
+        else:
+            status["fix_jumps_skipped"] = True
+
+    # A jump correction rewrote model_dir mid-run — cached outputs from the
+    # ORIGINAL (uncorrected) model are now stale even if force wasn't passed.
+    redo = force or status.get("trajectory_jumps_corrected", False)
+
     # 4. metric scale from marker
-    if force or not (sfm_dir / "scale.json").exists():
-        sh([PY, "04_scale/scale_sfm.py", model_dir, frames_dir], f"{stem}:scale")
+    scale_script = "04_scale/scale_sfm.py" if marker_type == "custom" else "04_scale/scale_sfm_aruco.py"
+    if redo or not (sfm_dir / "scale.json").exists():
+        sh([PY, scale_script, model_dir, frames_dir], f"{stem}:scale")
     if not (sfm_dir / "scale.json").exists():
-        status["error"] = "no reliable marker scale"
-        return status
+        return fail(f"no reliable {marker_type} marker scale")
     status["scale"] = json.loads((sfm_dir / "scale.json").read_text())
 
     # 5. room dimensions
-    if force or not (sfm_dir / "room_dims.json").exists():
-        sh([PY, "05_geometry/room_dims.py", sfm_dir, "--model", model_dir.name],
-           f"{stem}:dims")
+    if redo or not (sfm_dir / "room_dims.json").exists():
+        dims_cmd = [PY, "05_geometry/room_dims.py", sfm_dir, "--model", model_dir.name]
+        if dense_ply and dense_ply.exists():
+            dims_cmd += ["--dense-ply", dense_ply]
+        sh(dims_cmd, f"{stem}:dims")
     if (sfm_dir / "room_dims.json").exists():
         status["room_dims"] = json.loads((sfm_dir / "room_dims.json").read_text())
+
+    # 5b. scan-completeness scoring + re-shoot suggestions (opt-in via
+    # --coverage; best-effort — HPR occlusion scoring + DBSCAN clustering,
+    # see 10_quality/coverage.py)
+    if coverage:
+        coverage_json = sfm_dir / "coverage.json"
+        if redo or not coverage_json.exists():
+            print(f"[{stem}:coverage]")
+            coverage_cmd = [PY, "10_quality/coverage.py", sfm_dir, "--model", model_dir.name]
+            if dense_ply and dense_ply.exists():
+                coverage_cmd += ["--dense-ply", dense_ply]
+            res = subprocess.run([str(c) for c in coverage_cmd], cwd=ROOT)
+            if res.returncode != 0:
+                print(f"[{stem}:coverage] errored (non-fatal)")
+        if coverage_json.exists():
+            status["coverage"] = json.loads(coverage_json.read_text())
+        else:
+            status["coverage_skipped"] = True
 
     # 6. room-frame alignment (opt-in via --align; best-effort — needs marker_triangulation
     #    scale, so it's a no-op for videos that fell back to depth_ratio scaling)
     if align:
         topdown_path = sfm_dir / "aligned_room" / "topdown.png"
-        if force or not topdown_path.exists():
+        if redo or not topdown_path.exists():
+            print(f"[{stem}:align]")
             for script in ["05_alignment/align_world.py", "05_alignment/align_room.py"]:
                 res = subprocess.run(
                     [str(c) for c in [PY, script, sfm_dir]], cwd=ROOT)
@@ -149,7 +282,8 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
     # Ruecklauf pairing signal when both flags are passed together)
     if pipes:
         pipe_lengths_json = sfm_dir / "pipe_lengths.json"
-        if force or not pipe_lengths_json.exists():
+        if redo or not pipe_lengths_json.exists():
+            print(f"[{stem}:pipes]")
             res = subprocess.run(
                 [str(c) for c in [PY, "07_pipes/pipe_paths.py", sfm_dir, frames_dir,
                                   "--model", model_dir.name]],
@@ -165,10 +299,14 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
     # 7. placement recommendation (opt-in via --placement; best-effort — skip if no clean wall)
     if placement:
         placement_json = sfm_dir / "placement_3d.json"
-        if force or not placement_json.exists():
+        if redo or not placement_json.exists():
+            print(f"[{stem}:placement]")
+            placement_cmd = [PY, "06_placement/placement_3d.py", sfm_dir, frames_dir,
+                             "--model", model_dir.name]
+            if dense_ply and dense_ply.exists():
+                placement_cmd += ["--dense-ply", dense_ply]
             res = subprocess.run(
-                [str(c) for c in [PY, "06_placement/placement_3d.py", sfm_dir, frames_dir,
-                                  "--model", model_dir.name]],
+                [str(c) for c in placement_cmd],
                 cwd=ROOT,
             )
             if res.returncode != 0:
@@ -178,7 +316,37 @@ def process_video(video: Path, out_root: Path, fps: float, max_dim: int,
         else:
             status["placement_skipped"] = True
 
+    # 8. mesh + point cloud export (opt-in via --export; best-effort — needs
+    # a real deliverable file, not just JSON numbers, to open in Blender/
+    # MeshLab/CAD; see 09_export/export_mesh.py for why BPA not Poisson)
+    if export:
+        export_json = sfm_dir / "export" / "export.json"
+        if redo or not export_json.exists():
+            print(f"[{stem}:export]")
+            export_cmd = [PY, "09_export/export_mesh.py", sfm_dir, "--model", model_dir.name]
+            if dense_ply and dense_ply.exists():
+                export_cmd += ["--dense-ply", dense_ply]
+            res = subprocess.run([str(c) for c in export_cmd], cwd=ROOT)
+            if res.returncode != 0:
+                print(f"[{stem}:export] errored (non-fatal)")
+        if export_json.exists():
+            status["export"] = json.loads(export_json.read_text())
+        else:
+            status["export_skipped"] = True
+
+    # 9. composite quality score — always runs, pure JSON aggregation over
+    # whatever the stages above produced (see 10_quality/quality_score.py)
+    print(f"[{stem}:quality]")
+    quality_res = subprocess.run(
+        [str(c) for c in [PY, "10_quality/quality_score.py", sfm_dir, "--model", model_dir.name]],
+        cwd=ROOT,
+    )
+    quality_json = sfm_dir / "quality_score.json"
+    if quality_res.returncode == 0 and quality_json.exists():
+        status["quality_score"] = json.loads(quality_json.read_text())
+
     status["runtime_s"] = round(time.perf_counter() - t_start, 1)
+    status.pop("_t_start", None)
 
     # 7. consolidated report
     report = work / "report.json"
@@ -239,6 +407,31 @@ def print_summary(results: list[dict]) -> None:
                   f"clearance={best['clearance_cm']:.0f}cm height={best['mount_height_cm']:.0f}cm")
         elif r.get("placement_skipped"):
             print("  place: skipped (no clean single-wall marker for a reliable plane)")
+        if r.get("dense_cloud"):
+            print(f"  dense: {r['dense_cloud']}")
+        elif r.get("dense_skipped"):
+            print("  dense: skipped (needs CUDA colmap.exe — see COLMAP_BIN)")
+        jumps = r.get("trajectory_jumps")
+        if jumps:
+            n = len(jumps.get("jumps_applied", []))
+            if n:
+                print(f"  jumps: corrected {n} trajectory jump(s) — sparse model replaced")
+            else:
+                print(f"  jumps: {len(jumps.get('jumps_skipped', []))} candidate(s) checked, none corrected")
+        export = r.get("export")
+        if export and export.get("obj"):
+            print(f"  export: {export['n_mesh_vertices']:,} verts / {export['n_mesh_triangles']:,} tris "
+                  f"({export['source']} cloud) -> {export['obj']}")
+        elif r.get("export_skipped"):
+            print("  export: skipped (too few points, or Ball Pivoting produced no triangles)")
+        cov = r.get("coverage")
+        if cov:
+            print(f"  coverage: {cov['coverage_score']*100:.0f}% — {cov['n_suggestions']} re-shoot suggestion(s)")
+        elif r.get("coverage_skipped"):
+            print("  coverage: skipped")
+        q = r.get("quality_score")
+        if q and q.get("quality_score") is not None:
+            print(f"  quality: {q['quality_score']:.0f}/100")
 
 
 def main():
@@ -258,7 +451,16 @@ def main():
     parser.add_argument("--force", action="store_true", help="Redo cached stages")
     parser.add_argument("--calibrate", action="store_true",
                         help="Calibrate camera intrinsics from marker sightings "
-                             "(fixes focal length instead of self-calibrating)")
+                             "(fixes focal length instead of self-calibrating). "
+                             "Custom-board only — no-op (self-calibrates) with --marker-type aruco.")
+    parser.add_argument("--marker-type", default="custom", choices=["custom", "aruco"],
+                        help="'custom' (default): the printed 3x3 boiler-room board, scale from "
+                             "04_scale/scale_sfm.py. 'aruco': OpenCV ArUco markers (DICT_4X4_100 "
+                             "by default, ARUCO_DICT/ARUCO_MARKER_SIZE_CM env vars), scale from "
+                             "04_scale/scale_sfm_aruco.py — needs 2+ markers with at least two "
+                             "co-visible in one frame (same algorithm as the sibling photogram "
+                             "project's ArUco pipeline: physical baseline vs SfM-unit triangulated "
+                             "distance between marker pairs, not single-marker known-size geometry).")
     parser.add_argument("--gpu", action="store_true",
                         help="Use CUDA for SfM feature extraction/matching/mapping")
     parser.add_argument("--align", action="store_true",
@@ -270,6 +472,31 @@ def main():
     parser.add_argument("--placement", action="store_true",
                         help="Also run the placement recommendation stage "
                              "(default: pipeline stops after room dimensions)")
+    parser.add_argument("--dense", action="store_true",
+                        help="Also run CUDA dense reconstruction (patch-match stereo + "
+                             "fusion) after SfM, producing sfm_dir/dense/fused.ply. "
+                             "Best-effort/non-fatal; requires COLMAP_BIN (a CUDA-enabled "
+                             "colmap.exe — the PyPI pycolmap wheel is CPU-only, see "
+                             "03_reconstruction/run_mvs.py). When it succeeds, room_dims.py "
+                             "uses the dense cloud for footprint/height (more points on "
+                             "textureless walls/floors than sparse SIFT features give) and "
+                             "placement_3d.py uses it for wall-surface evidence instead of "
+                             "single-frame monocular depth (--dense-ply on both scripts).")
+    parser.add_argument("--fix-jumps", action="store_true",
+                        help="Detect and correct mis-registered 'teleport' blocks caused by "
+                             "a tracking break (see 03_reconstruction/fix_trajectory_jumps.py). "
+                             "Best-effort/non-fatal; writes a corrected sparse model that "
+                             "scale/room_dims/align/pipes/placement then use instead.")
+    parser.add_argument("--export", action="store_true",
+                        help="Export a real deliverable: colored point cloud (PLY/LAS) + a "
+                             "Ball-Pivoting mesh (OBJ) to sfm_dir/export/ (see "
+                             "09_export/export_mesh.py). Best-effort/non-fatal; uses --dense's "
+                             "cloud when available for a much better mesh.")
+    parser.add_argument("--coverage", action="store_true",
+                        help="Score scan completeness (HPR occlusion + view-angle scoring) and "
+                             "generate re-shoot suggestions for under-covered areas, colored "
+                             "cloud + coverage.json (see 10_quality/coverage.py). "
+                             "Best-effort/non-fatal; uses --dense's cloud when available.")
     args = parser.parse_args()
 
     # Bare names (no path separator) resolve against --dataset; anything
@@ -303,6 +530,15 @@ def main():
                 cmd.append("--pipes")
             if args.placement:
                 cmd.append("--placement")
+            if args.dense:
+                cmd.append("--dense")
+            if args.fix_jumps:
+                cmd.append("--fix-jumps")
+            if args.export:
+                cmd.append("--export")
+            if args.coverage:
+                cmd.append("--coverage")
+            cmd += ["--marker-type", args.marker_type]
             procs.append((v, subprocess.Popen(cmd, cwd=ROOT)))
             while sum(p.poll() is None for _, p in procs) >= args.parallel:
                 time.sleep(2)
@@ -311,7 +547,8 @@ def main():
         return
 
     results = [process_video(v, args.output, args.fps, args.max_dim, args.force,
-                             args.calibrate, args.gpu, args.align, args.pipes, args.placement)
+                             args.calibrate, args.gpu, args.align, args.pipes, args.placement,
+                             args.dense, args.fix_jumps, args.marker_type, args.export, args.coverage)
                for v in args.videos]
     print_summary(results)
 
