@@ -33,7 +33,7 @@ exact model they were triangulated in (a mismatched model would silently
 get a wrong-but-plausible-looking transform applied).
 
 Usage:
-  python 05_alignment/align_world.py output/pipeline/<video>/sfm
+  python 05_geometry/align_world.py output/pipeline/<video>/sfm
 """
 
 import argparse

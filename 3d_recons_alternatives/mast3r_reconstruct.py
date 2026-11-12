@@ -44,8 +44,8 @@ Usage (single video):
 
 Usage (batch — every "<video>/frames" folder under a root):
   python 3d_recons_alternatives/mast3r_reconstruct.py \
-      --frames-root "C:\\thermovation-output\\sfm 1" \
-      --out "C:\\thermovation-output\\3d_recons_alternatives\\mast3r"
+      --frames-root "output\\pipeline" \
+      --out "output\\3d_recons_alternatives\\mast3r"
 """
 
 import argparse

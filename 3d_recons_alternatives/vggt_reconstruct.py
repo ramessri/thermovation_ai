@@ -37,8 +37,8 @@ Usage (single video):
 
 Usage (batch — every video with a completed sfm/ under a root):
   python 3d_recons_alternatives/vggt_reconstruct.py \
-      --sfm-root "C:\\thermovation-output\\sfm 1" \
-      --out "C:\\thermovation-output\\3d_recons_alternatives\\vggt"
+      --sfm-root "output\\pipeline" \
+      --out "output\\3d_recons_alternatives\\vggt"
 """
 
 import argparse

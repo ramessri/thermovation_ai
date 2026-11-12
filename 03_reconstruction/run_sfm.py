@@ -20,7 +20,7 @@ OpenGL support" outright; there is no silent CPU fallback. So --gpu here
 does NOT call pycolmap's Python GPU path — it shells out to a separately
 built/downloaded CUDA-enabled `colmap` CLI binary for feature extraction,
 matching, and bundle adjustment (set COLMAP_BIN, e.g.
-C:\\thermovation-repos\\colmap-cuda\\bin\\colmap.exe on this machine), the
+C:\\path\\to\\colmap.exe), the
 same approach 03_reconstruction/run_mvs.py uses for dense reconstruction.
 Without --gpu, everything still runs through pycolmap exactly as before —
 this only changes behavior when --gpu is explicitly requested.
@@ -49,7 +49,7 @@ def _resolve_cuda_colmap() -> str:
     if not resolved:
         raise SystemExit(
             f"--gpu requires a CUDA-enabled colmap binary; COLMAP_BIN={COLMAP_BIN!r} not found. "
-            f'Set it, e.g. $env:COLMAP_BIN = "C:\\thermovation-repos\\colmap-cuda\\bin\\colmap.exe"'
+            f'Set it, e.g. $env:COLMAP_BIN = "C:\\path\\to\\colmap.exe"'
         )
     out = subprocess.run([resolved, "-h"], capture_output=True, text=True, timeout=15)
     if "with CUDA" not in out.stdout:

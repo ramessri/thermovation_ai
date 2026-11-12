@@ -15,6 +15,14 @@ sam2                    # Meta SAM2 (pip install sam2)
 
 # structure-from-motion
 pycolmap
+# DISK+LightGlue SfM variant (03_reconstruction/run_sfm_disk_lightglue.py) needs hloc:
+#   pip install git+https://github.com/cvg/Hierarchical-Localization.git
+
+# point clouds, export, coverage (03_reconstruction, 05_geometry, 06_placement, 09_export, 10_quality)
+open3d
+scikit-learn
+trimesh
+laspy
 
 # alternate 3D reconstruction (3d_recons_alternatives/) — gsplat's own
 # examples/simple_trainer.py isn't in the pip package, clone it from

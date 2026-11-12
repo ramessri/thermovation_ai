@@ -20,7 +20,7 @@ Usage (single video):
 
 Usage (batch — every video under a root with a completed sfm/ + frames/):
   python 08_depth/ceiling_check.py \
-      --sfm-root "C:\\thermovation-output\\sfm 1" \
+      --sfm-root "output\\pipeline" \
       --out 08_depth/results/ceiling_check_all
 """
 

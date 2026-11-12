@@ -35,7 +35,7 @@ reconstructions on the same videos without needing scale.json at all.
 
 Usage:
   python 03_reconstruction/run_sfm_disk_lightglue.py \
-      --frames-dir "C:\\thermovation-output\\sfm 1\\Klaus_Rombergg\\frames" \
+      --frames-dir "output\\pipeline\\Klaus_Rombergg\\frames" \
       --out output/disk_lightglue/Klaus_Rombergg --window 15
 """
 

@@ -16,8 +16,8 @@ dense-only stages, while everything else in this repo keeps using pycolmap
 directly. Undistortion has no CUDA requirement, so it still goes through
 pycolmap for consistency with the rest of the codebase.
 
-Set COLMAP_BIN to a CUDA-enabled colmap(.exe). On this machine that's
-C:\\thermovation-repos\\colmap-cuda\\bin\\colmap.exe (prebuilt Windows CUDA
+Set COLMAP_BIN to a CUDA-enabled colmap(.exe). For example:
+C:\\path\\to\\colmap.exe (prebuilt Windows CUDA
 release, no source build needed).
 
 Output: <sfm_dir>/dense/fused.ply (plus the COLMAP-format undistorted
@@ -53,7 +53,7 @@ def _require_cuda_colmap() -> None:
         raise SystemExit(
             f"run_mvs: colmap binary not found at COLMAP_BIN={COLMAP_BIN!r}. "
             f"Set COLMAP_BIN to a CUDA-enabled colmap.exe, e.g.\n"
-            f'  $env:COLMAP_BIN = "C:\\thermovation-repos\\colmap-cuda\\bin\\colmap.exe"'
+            f'  $env:COLMAP_BIN = "C:\\path\\to\\colmap.exe"'
         )
     out = subprocess.run([resolved, "-h"], capture_output=True, text=True, timeout=15)
     if "with CUDA" not in out.stdout:

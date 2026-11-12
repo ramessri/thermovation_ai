@@ -6,7 +6,7 @@ origin = the floor point directly below the wall marker, Y = horizontal
 direction from the marker into the room (toward the camera cluster), X
 completes a right-handed frame (along the wall).
 
-This differs from 05_alignment/align_world.py, which maps the marker
+This differs from 05_geometry/align_world.py, which maps the marker
 PLANE to world XY (Z = wall normal) — correct for placement work relative
 to the wall, but a plain top-down (looking down Z) of that frame is a
 face-on view of the wall, not a floor plan. Here Z is vertical, so a
@@ -18,7 +18,7 @@ own 9 triangulated 3D points) — not available for depth_ratio_fallback
 scale (marker too small/distant to triangulate directly).
 
 Usage:
-  python 05_alignment/align_room.py output/pipeline/<video>/sfm
+  python 05_geometry/align_room.py output/pipeline/<video>/sfm
 """
 
 import argparse
@@ -30,10 +30,8 @@ import cv2
 import numpy as np
 import pycolmap
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "05_geometry"))
-from room_dims import load_filtered_points, gravity_rotation, largest_cluster_mask
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from room_dims import load_filtered_points, gravity_rotation, largest_cluster_mask
 from align_world import pick_best_segment
 
 

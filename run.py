@@ -267,7 +267,7 @@ def _process_video_inner(video: Path, out_root: Path, fps: float, max_dim: int,
         topdown_path = sfm_dir / "aligned_room" / "topdown.png"
         if redo or not topdown_path.exists():
             print(f"[{stem}:align]")
-            for script in ["05_alignment/align_world.py", "05_alignment/align_room.py"]:
+            for script in ["05_geometry/align_world.py", "05_geometry/align_room.py"]:
                 res = subprocess.run(
                     [str(c) for c in [PY, script, sfm_dir]], cwd=ROOT)
                 if res.returncode != 0:

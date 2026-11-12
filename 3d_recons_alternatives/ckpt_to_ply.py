@@ -4,7 +4,7 @@ by examples/simple_trainer.py's own torch.save) into the standard 3DGS PLY
 format gaussians_to_room_dims.py expects.
 
 This gsplat version (matching the installed pip package, checked out via
-git tag v1.4.0 in C:\\thermovation-repos\\gsplat) doesn't have the
+git tag v1.4.0 in a local gsplat clone) doesn't have the
 --save_ply flag newer gsplat versions do — see 3d_recons_alternatives/README
 for the version this project's install actually has. Only the fields
 gaussians_to_room_dims.py reads are written (x,y,z,opacity,scale_0..2) —

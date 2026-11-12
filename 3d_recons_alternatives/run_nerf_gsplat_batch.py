@@ -9,8 +9,7 @@ Neither method needs admin rights on this machine:
     just ffmpeg + COLMAP CLI binaries on PATH (portable downloads, see README).
   - gsplat's CUDA rasterizer DOES need a real C++ compiler at JIT-compile time;
     that's provided by a portable MSVC + Windows SDK downloaded with
-    3d_recons_alternatives/../portable-msvc (mmozeiko's script) into
-    C:\\thermovation-repos\\portable-msvc\\msvc — no installer, no admin.
+    mmozeiko's portable-msvc script into MSVC_ROOT — no installer, no admin.
     CUDA 13.2's headers additionally require NVCC_APPEND_FLAGS=-Xcompiler
     /Zc:preprocessor or nvcc's C1189 fatal error fires on the traditional
     MSVC preprocessor.
@@ -46,19 +45,24 @@ import pycolmap
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 
-SFM_ROOT = Path(r"C:\thermovation-output\sfm 1")
-OUT = Path(r"C:\thermovation-output\3d_recons_alternatives")
+from dotenv import load_dotenv
+
+load_dotenv(ROOT / ".env")
+
+# Machine-specific locations come from .env (see .env.example).
+SFM_ROOT = Path(os.environ.get("OUTPUT_DIR", "output/pipeline"))
+OUT = Path(os.environ.get("RECONS_OUTPUT_DIR", "output/3d_recons_alternatives"))
 NERF_DATA = OUT / "nerf_data"
 GSPLAT_DATA = OUT / "gsplat_data"
 RESULTS = OUT / "results"
 GSPLAT_RESULTS = OUT / "gsplat_results"
 
-FFMPEG_BIN = r"C:\thermovation-repos\ffmpeg\ffmpeg-master-latest-win64-gpl\bin"
-COLMAP_BIN = r"C:\thermovation-repos\colmap\bin"
-MSVC_ROOT = r"C:\thermovation-repos\portable-msvc\msvc"
-MSVC_VER = "14.51.36231"
-SDK_VER = "10.0.28000.0"
-GSPLAT_EXAMPLES = Path(r"C:\thermovation-repos\gsplat\examples")
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN_DIR", "")
+COLMAP_BIN = os.environ.get("COLMAP_BIN_DIR", "")
+MSVC_ROOT = os.environ.get("MSVC_ROOT", "")
+MSVC_VER = os.environ.get("MSVC_VER", "14.51.36231")
+SDK_VER = os.environ.get("WINSDK_VER", "10.0.28000.0")
+GSPLAT_EXAMPLES = Path(os.environ.get("GSPLAT_EXAMPLES_DIR", "gsplat/examples"))
 
 NERF_ITERS = 500
 GSPLAT_STEPS = 1500
@@ -73,7 +77,8 @@ def deadline_hit() -> bool:
 
 def nerf_env() -> dict:
     env = os.environ.copy()
-    env["PATH"] = f"{FFMPEG_BIN};{COLMAP_BIN};" + env.get("PATH", "")
+    extra = [p for p in (FFMPEG_BIN, COLMAP_BIN) if p]
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
@@ -81,6 +86,10 @@ def nerf_env() -> dict:
 
 def gsplat_env() -> dict:
     env = os.environ.copy()
+    if not MSVC_ROOT:
+        # Assume a normal Visual Studio install is already on PATH.
+        env["NVCC_APPEND_FLAGS"] = "-Xcompiler /Zc:preprocessor"
+        return env
     vc_bin = rf"{MSVC_ROOT}\VC\Tools\MSVC\{MSVC_VER}\bin\Hostx64\x64"
     sdk_bin = rf"{MSVC_ROOT}\Windows Kits\10\bin\{SDK_VER}\x64"
     sdk_bin_ucrt = rf"{MSVC_ROOT}\Windows Kits\10\bin\{SDK_VER}\x64\ucrt"

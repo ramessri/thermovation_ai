@@ -19,7 +19,7 @@ depth_scale.py/vggt_reconstruct.py already use), not a full re-alignment.
 Usage:
   python 03_reconstruction/disk_lightglue_room_dims.py \
       --disk-lg-dir 3d_recons_alternatives/disk_lg/Klaus_Rombergg \
-      --sfm-dir "C:\\thermovation-output\\sfm 1\\Klaus_Rombergg\\sfm" --sfm-model 0
+      --sfm-dir "output\\pipeline\\Klaus_Rombergg\\sfm" --sfm-model 0
 """
 
 import argparse

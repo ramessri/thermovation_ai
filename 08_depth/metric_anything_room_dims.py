@@ -30,17 +30,17 @@ noise to hide) is visible rather than silently averaged away.
 
 Usage (single video, default model = metric_anything):
   python 08_depth/metric_anything_room_dims.py \
-      --frames-dir "C:\\thermovation-output\\sfm 1\\IMG_3126\\frames" \
+      --frames-dir "output\\pipeline\\IMG_3126\\frames" \
       --out 08_depth/results_metric_anything/IMG_3126
 
 Usage (DepthPro instead):
   python 08_depth/metric_anything_room_dims.py --depth-model depthpro \
-      --frames-dir "C:\\thermovation-output\\sfm 1\\IMG_3126\\frames" \
+      --frames-dir "output\\pipeline\\IMG_3126\\frames" \
       --out 08_depth/results_depthpro/IMG_3126
 
 Usage (batch — every "<video>/frames" folder under a root):
   python 08_depth/metric_anything_room_dims.py \
-      --frames-root "C:\\thermovation-output\\sfm 1" \
+      --frames-root "output\\pipeline" \
       --out 08_depth/results_metric_anything
 """
 
